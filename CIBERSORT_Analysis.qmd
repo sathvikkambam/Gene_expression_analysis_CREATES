@@ -1,0 +1,93 @@
+---
+title: "CIBERSORT Attempt"
+format: html
+editor: visual
+---
+
+# Loading Libraries
+
+```{r}
+library(e1071)
+library(parallel)
+library(preprocessCore)
+library(CIBERSORT)
+library(tidyverse)
+library(dplyr)
+library(biomaRt)
+library(tibble)
+library(stringr)
+```
+
+# Running CIBERSORT
+
+```{r}
+#Converting ENSG gene ids into HUGO names
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+col_name = c("gene_id","gene_name","gene_type","unstranded","stranded_first","stranded_second","tpm_unstranded","fpkm_unstranded","fpkm_uq_unstranded")
+
+files <- list.files("data/CIBERSORT", pattern="*.tsv", full.names=TRUE)
+
+mixture_file <- read_tsv(files, comment="#", col_names = col_name, skip=6)
+
+gene_num <- length(unique(mixture_file$gene_id))
+mixture_file <- mixture_file |> mutate(
+  sample =  paste0("sample", ((row_number()-1) %/% gene_num) + 1)
+)
+
+#Gets reference file for the method
+sig_matrix <- CIBERSORT::LM22
+
+
+#Removes the values after the dots from the gene_ids while keeping the _PAR_Y data
+#Splits the gene_id along the periods
+temp <- sapply(mixture_file$gene_id, function(data) str_split_1(data, "\\."))
+temp3 <- mixture_file$gene_name
+
+#Finds the values whose values after the period are longer than 2, since those have _PAR_Y after
+temp2 <- sapply(temp[2, ], str_length) > 2
+
+#Changes the first column to include the _PAR_Y for those values
+temp[1, temp2] <- sapply(temp[1, temp2], function(data) paste0(data, "_PAR_Y"))
+temp3[temp2] <- sapply(temp3[temp2], function(data) paste0(data, "_PAR_Y"))
+
+#Puts it into the cancer data
+mixture_file$gene_id <- temp[1, ]
+mixture_file$gene_name <- temp3
+
+#Some names dont match, so the proper names have to be found
+
+#If a rowname of sig isn't in gene_name, then get new name from G_list_sig
+indexReplace <- which(!rownames(sig_matrix) %in% mixture_file$gene_name)
+
+#Looks in ensembl database for which synonym goes to what name
+G_list_sig <- getBM(filters= "external_synonym", attributes= c("external_synonym","hgnc_symbol"),values=rownames(sig_matrix)[indexReplace],mart= mart)
+
+
+indexReplace <- which((!rownames(sig_matrix) %in% mixture_file$gene_name) & (str_to_upper(rownames(sig_matrix)) %in% G_list_sig$external_synonym))
+
+rownames(sig_matrix)[indexReplace] <- G_list_sig$hgnc_symbol
+
+mix_file <- mixture_file |> dplyr::select(ID = gene_id, Name = gene_name, tpm = tpm_unstranded, sample =sample) |> pivot_wider(names_from = sample, values_from = tpm)
+
+mix_file <- mix_file |> dplyr::select(!ID)
+mix_file <- mix_file[-which(duplicated(mix_file$Name)), ]
+
+sig_file <- as.data.frame(sig_matrix)
+sig_file <- rownames_to_column(sig_file, var = "Name")
+
+sig_path <- "data/CIBERSORT/LM22_HGNC.txt"
+mix_path <- "data/CIBERSORT/test_sample.txt"
+
+#Create files for results and input filepaths
+#if(!file.exists(sig_path)){
+  write_tsv(sig_file, sig_path)
+#}
+#if(!file.exists(mix_path)){
+  write_tsv(mix_file, mix_path)
+#}
+
+results0 <- cibersort(sig_path, mix_path, perm = 0, QN = TRUE)
+results1 <- cibersort(sig_path, mix_path, perm = 1, QN = TRUE)
+results10 <- cibersort(sig_path, mix_path, perm = 10, QN = TRUE)
+```

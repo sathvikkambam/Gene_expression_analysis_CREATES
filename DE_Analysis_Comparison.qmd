@@ -1,0 +1,901 @@
+---
+title: "Limma vs DESeq2"
+format: html
+editor: visual
+---
+
+# Loading libraries
+
+```{r}
+#| include: false
+
+library(jsonlite)
+library(tidyverse)
+library(ggplot2)
+library(DESeq2)
+library("Biobase")
+library("gplots")
+library("ggplot2")
+library("RColorBrewer")
+library("pheatmap")
+library("matrixStats")
+library("lattice")
+library("gtools")
+library("dplyr")
+library(edgeR)
+library(ggsignif)
+library("BiocParallel")
+library("ggpubr")
+
+```
+
+# Control Variables
+
+```{r}
+nN = 20
+nC = 20
+geneList = c("ADGRE5", "CD109", "CD151", "ALCAM", "CD276", "EPCAM")
+all = T
+paired = T
+runDESeq = F
+```
+
+# Functions
+
+```{r}
+#To get gene name, run:
+#(cancer_gene_key |> filter(gene_name=="CD109"))[1, ]$gene_id
+#Plots a boxplot of the gene of interest
+geneBoxPlot <- function(geneName, ddsData, resData) {
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  cPlot <- plotCounts(ddsData, 
+                    gene=geneId, 
+                    intgroup="condition", 
+                    returnData = TRUE,
+                    transform = TRUE
+                    )
+  #Gets the adjusted p values for the gene
+  pGene <- resData[geneId, ]$padj
+
+    graph <- cPlot |> ggplot(aes(x=condition, y=count, fill=condition))+
+    geom_boxplot(outliers = FALSE) + 
+#  geom_point(position=position_jitter(w=0.1,h=0), alpha = 0.2) +
+  labs(
+    title=paste("mRNA Counts for",geneName),
+    subtitle=paste("Gene ID:", geneId),
+    caption=paste("p-value =", pGene)
+  )
+  return(cPlot)
+}
+```
+
+```{r}
+#Return points to plot for normal vs cancer
+genePlotPoints <- function(geneName, ddsData, resData) {
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  cPlot <- plotCounts(ddsData, 
+                    gene=geneId, 
+                    intgroup="condition", 
+                    returnData = TRUE
+                    )
+  return(cPlot)
+}
+```
+
+```{r}
+#Return log2cpm points for DESeq2
+genePlotPointsLCPM <- function(geneName, ddsData, resData) {
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  data_mat <- assay(normTransform(ddsData))
+  gene_data <- data_mat[geneId, ]
+  
+  pointsData <- as.data.frame(gene_data)
+
+  pointsData$condition <- ddsData$condition
+  
+  return(pointsData)
+}
+```
+
+```{r}
+#Converts a gene name to an id
+nameToID <- function(geneName){
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  geneId <- as.vector(geneId)[1]
+  return(geneId)
+}
+```
+
+# Limma vs DESeq2
+
+This is setting up the combined data and metadata as well as random subsets \### Data loading
+
+```{r}
+#Normal Data loading
+#TCGA BRCA data
+normal_breast <- read_rds("data/Normal_Breast/TCGA_BRCA/normal_breast_BRCA.rds")
+
+#Loads metadata such as batch data for these samples
+metadata_normal <- fromJSON("data/Normal_Breast/TCGA_BRCA/metadata.repository.BRCA.normal.json")
+
+
+#Cancer Data
+#Loads the metadata
+metadata_cancer = fromJSON("data/Cancer_Breast/metadata.repository.BRCA.cancer.json")
+
+#Load mRNA sequencing data
+cancer_breast <- read_rds("data/Cancer_Breast/cancer_breast_BRCA.rds")
+```
+
+Modify metadata
+
+```{r}
+#Select columns of interest
+metTempN <- metadata_normal |> select(associated_entities, file_name)
+
+#Extract barcode from associated entities
+metTempN$barcode <- bind_rows( #Combines all data frames in the list
+                                      metTempN$associated_entities
+                            )$entity_submitter_id
+
+#Extract case id from associated entities
+metTempN$subject <- bind_rows( #Combines all data frames in the list
+                                      metTempN$associated_entities
+                            )$case_id
+
+#Select columns of interest
+metTempC <- metadata_cancer |> select(associated_entities, file_name)
+
+#Extract barcode from associated entities
+metTempC$barcode <- bind_rows( #Combines all data frames in the list
+                                      metTempC$associated_entities
+                            )$entity_submitter_id
+
+#Extract cacse id from associated entities
+metTempC$subject <- bind_rows( #Combines all data frames in the list
+                                      metTempC$associated_entities
+                            )$case_id
+
+#Gets the plate value, which is the 6th part of the barcode
+metTempN <- metTempN |> mutate(
+  plate = sapply(
+    metTempN$barcode,
+    function(data) str_split_i(data, "-", 6)
+  )
+)
+metTempC <- metTempC |> mutate(
+  plate = sapply(
+    metTempC$barcode,
+    function(data) str_split_i(data, "-", 6)
+  )
+)
+
+
+#Finalize metadata
+meta_normal <- metTempN |> select(!associated_entities)
+meta_cancer <- metTempC |> select(!associated_entities)
+```
+
+### Combining Data
+
+Now the data is going to be combined
+
+```{r}
+#TCGA
+norm_gene_key <- normal_breast |> select(gene_id, gene_name)
+tempN <- normal_breast |> select(!c(gene_name))
+
+#Now for cancer samples
+cancer_gene_key <- cancer_breast |> select(gene_id, gene_name)
+tempC <- cancer_breast |> select(!c(gene_name))
+
+#Name and gene_id are kept to be used as the key for joining them together
+#Combines gene id for the combined matrix
+combined_breast <- tempN |> full_join(tempC, join_by(gene_id == gene_id))
+
+#Forms the matrix while movign the Name column into the row names
+combined_breast_matrix <- as.matrix(
+  column_to_rownames(combined_breast, var = "gene_id") #would be "Name" if GTex
+)
+
+#Turns NA values to 0
+combined_breast_matrix[is.na(combined_breast_matrix)] <- 0
+
+
+```
+
+Now metadata for all the samples is going to be created
+
+```{r}
+#Labels each metadata by the condition
+metTempN <- meta_normal |> mutate(condition = "normal")
+metTempC <- meta_cancer |> mutate(condition = "cancer")
+
+combined_meta <- bind_rows(metTempN,metTempC)
+
+#Turn file name into sample
+combined_meta$sample <- sapply(
+  combined_meta$file_name,
+  function(data) str_split_i(data, "\\.", 1)
+)
+
+combined_meta <- combined_meta |> select(sample, condition, subject, plate)
+
+#Gets subtypes
+combined_subtype <- read_rds("data/Cancer_Breast/BRCA_subtype_manual.rds")
+temp <- rownames_to_column(combined_subtype) |> select(rowname, subtype = PAM50)
+combined_meta <- full_join(combined_meta, temp, join_by(sample == rowname))
+
+#Factors all columns and orders them
+combined_meta$sample <- factor(combined_meta$sample)
+combined_meta$condition <- factor(combined_meta$condition, levels = c("normal", "cancer"))
+combined_meta$subject <- factor(combined_meta$subject)
+combined_meta$plate <- factor(combined_meta$plate)
+combined_meta$subtype <- factor(combined_meta$subtype)
+
+```
+
+### Random Sampling
+
+```{r}
+#Takes a random sample of n points for normal and cancer samples
+#50-50
+#IF want to use all samples
+
+if (all){
+  sub_matrix = combined_breast_matrix
+  sub_meta = combined_meta
+} else {
+  if(!paired){
+    #Gets nN random normal samples
+    indexs1 <- sample(1:dim(meta_normal)[1], size = nN, replace = FALSE)
+    #Gets nC random cancer samples
+    indexs2 <- sample((min=dim(meta_normal)[1] + 1):dim(combined_meta)[1], size = nC, replace = FALSE)
+    
+    #Combined indixes
+    indexs <- sort(c(indexs1, indexs2))
+    
+    #Creates subarrays of the selected samples
+    sub_matrix <- combined_breast_matrix[, indexs]
+    sub_meta <- combined_meta[indexs, ]
+  } else {
+  
+    #Tries to get nN amount of cases and pairs up normal and cancer samples
+    cases <- combined_meta |> filter(condition == "normal") |> select(subject)
+    
+    indexsP <- sample(1:dim(cases)[1], size = nN, replace = FALSE)
+    casesP <- unfactor(cases[indexsP, ])
+    
+    sub_meta <- combined_meta |> filter(subject %in% casesP) |> group_by(condition, subject) |> slice_head(n = 1) |> ungroup()
+  }
+    sub_matrix <- combined_breast_matrix[, sub_meta$sample]
+}
+
+#Change levels
+sub_meta$sample <- factor(unfactor(sub_meta$sample))
+sub_meta$subject <- factor(unfactor(sub_meta$subject))
+sub_meta$plate <- factor(unfactor(sub_meta$plate))
+sub_meta$subtype <- factor(unfactor(sub_meta$subtype))
+```
+
+## BC Unpaired
+
+Compared DESeq2 and Limma
+
+### DESeq2 Analysis
+
+```{r}
+if (runDESeq){
+  
+  #Starts counting time
+  time1 = Sys.time()
+  
+  #Uses DESeq2 method to analyze the matrix data
+  dds <- DESeqDataSetFromMatrix(countData = sub_matrix,
+                                colData = sub_meta,
+                                #design = ~ batch + condition)
+                                design = ~ condition)
+  
+  #Sets normal patients as the control
+  dds$condition <- relevel(dds$condition, ref = "normal")
+  
+  #Prefilters to speed up method
+  temp <- sub_meta |> group_by(condition) |> summarize(n=n())
+  
+  smallestGroupSize <- 3
+  keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+  dds <- dds[keep,]
+  
+  #Used reduced method
+  dds <- DESeq(dds, fitType = "glmGamPoi", test="LRT", reduced = ~1)
+  
+  res <- results(dds)
+  
+  #Now the results of the genes are plotted
+  
+  #Gathers all plotting points for all genes
+  combBC <- data.frame()
+  for (gene in geneList){
+    combBC <- combBC |> bind_rows(
+    genePlotPoints(gene, dds, res) |> mutate(gene=gene))
+  }
+  
+  combBC <- combBC |> mutate(log2count = log2(count))
+  
+  #plots the values
+  graph1D <- combBC |> ggplot(aes(x=gene, y=log2count, fill=condition))+
+      geom_boxplot(outliers = FALSE) + 
+    labs(
+      title=paste("mRNA Counts for genes of interest"),
+      subtitle = "DESeq2 Unpaired"
+    )
+  
+  
+  
+  #Ends the time and prints time elapsed
+  
+  time2 = Sys.time()
+  
+  #Prints time elapsed
+  tDif1D = time2-time1
+}
+```
+
+### Limma Analysis
+
+```{r}
+#Start time
+time1 = Sys.time()
+
+factor1 <- sub_meta$condition
+
+#Makes DGEList object
+d0 <- DGEList(sub_matrix)
+
+#Calculates normalization factors
+d0 <- calcNormFactors(d0)
+
+#Filter low expression genes
+cutoff <- 3
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop,] 
+
+#gets lcpm data
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+
+#Makes design of analysis
+mm <- model.matrix(~0 + factor1)
+
+#VoomLmFit
+fit <- voomLmFit(d, mm)
+fit <- eBayes(fit)
+
+cPlot = data.frame()
+
+for( gene in geneList){
+  norm <- as.data.frame(fit$EList$E[nameToID(gene), ])
+  norm$condition <- sub_meta$condition
+  norm$gene <- gene
+  
+  colnames(norm) <- c("counts", "condition", "gene")
+  
+  cPlot <- cPlot |> bind_rows(norm)
+}
+
+# #Plotting expression values
+# norm <- as.data.frame(edgeR::cpm(d)[gene, ]) # to get normalized expression values.
+# norm$condition <- sub_meta$condition
+# colnames(norm) <- c("counts", "condition")
+
+graph1L <- cPlot |> ggplot(aes(x = gene, y= counts, fill = condition)) + geom_boxplot(outliers = F) + 
+  labs(
+    title=paste("mRNA Counts for genes of interest"),
+    subtitle = "Limma-voom Unpaired",
+    y = "log2CPM",
+  )
+
+#ENd time
+time2 = Sys.time()
+
+tDif1L <- time2-time1
+```
+
+### Comparison
+
+```{r}
+if (runDESeq){
+  graph1D
+  tDif1D
+}
+
+graph1L
+tDif1L
+```
+
+## BC Plate
+
+Compared DESeq2 and Limma
+
+### DESeq2 Analysis
+
+```{r}
+if (runDESeq){
+  
+  #Starts counting time
+  time1 = Sys.time()
+  
+  #Uses DESeq2 method to analyze the matrix data
+  dds <- DESeqDataSetFromMatrix(countData = sub_matrix,
+                                colData = sub_meta,
+                                #design = ~ batch + condition)
+                                design = ~ plate + condition)
+  
+  #Sets normal patients as the control
+  dds$condition <- relevel(dds$condition, ref = "normal")
+  
+  #Prefilters to speed up method
+  temp <- sub_meta |> group_by(condition) |> summarize(n=n())
+  
+  smallestGroupSize <- 3
+  keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+  dds <- dds[keep,]
+  
+  #Used reduced method
+  dds <- DESeq(dds, fitType = "glmGamPoi", test="LRT", reduced = ~plate)
+  
+  res <- results(dds)
+  
+  #Now the results of the genes are plotted
+  
+  #Gathers all plotting points for all genes
+  combBC <- data.frame()
+  for (gene in geneList){
+    combBC <- combBC |> bind_rows(
+    genePlotPoints(gene, dds, res) |> mutate(gene=gene))
+  }
+  
+  combBC <- combBC |> mutate(log2count = log2(count))
+  
+  #plots the values
+  graph2D <- combBC |> ggplot(aes(x=gene, y=log2count, fill=condition))+
+      geom_boxplot(outliers = FALSE) + 
+    labs(
+      title=paste("mRNA Counts for genes of interest"),
+      subtitle = "DESeq2 Batch"
+    )
+  
+  
+  
+  #Ends the time and prints time elapsed
+  
+  time2 = Sys.time()
+  
+  #Prints time elapsed
+  tDif2D <- time2-time1
+}
+```
+
+### Limma Analysis
+
+```{r}
+#Start time
+time1 = Sys.time()
+
+factor1 <- sub_meta$condition
+plate <- sub_meta$plate
+
+
+#Makes DGEList object
+d0 <- DGEList(sub_matrix)
+
+#Calculates normalization factors
+d0 <- calcNormFactors(d0)
+
+#Filter low expression genes
+cutoff <- 3
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop,] 
+
+#gets lcpm data
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+
+#Makes design of analysis
+mm <- model.matrix(~plate + factor1 )
+
+#VoomLmFit
+fit <- voomLmFit(d, mm)
+fit <- eBayes(fit)
+
+cPlot = data.frame()
+
+for( gene in geneList){
+  norm <- as.data.frame(fit$EList$E[nameToID(gene), ])
+  norm$condition <- sub_meta$condition
+  norm$gene <- gene
+  
+  colnames(norm) <- c("counts", "condition", "gene")
+  
+  cPlot <- cPlot |> bind_rows(norm)
+}
+
+# #Plotting expression values
+# norm <- as.data.frame(edgeR::cpm(d)[gene, ]) # to get normalized expression values.
+# norm$condition <- sub_meta$condition
+# colnames(norm) <- c("counts", "condition")
+
+graph2L <- cPlot |> ggplot(aes(x = gene, y= counts, fill = condition)) + geom_boxplot(outliers = F) + 
+  labs(
+    title=paste("mRNA Counts for genes of interest"),
+    subtitle = "Limma-voom Batch",
+    y = "log2CPM",
+  )
+
+#ENd time
+time2 = Sys.time()
+
+tDif2L <- time2-time1
+
+
+#Removing batch effects from the plate
+#Getting list of samples
+cPlot$sample <- c(rep(combined_meta$sample, length(geneList)))
+
+#Makes matrix of log2 genes exp values
+tempCounts <- cPlot |> select(!condition) |> pivot_wider(names_from = sample, values_from = counts)
+tempCounts <- column_to_rownames(tempCounts, "gene")
+
+#Makes the factor a numeric matrix and removes batch effects
+levels(factor1) <- 1:length(levels(factor1))
+normCounts <- removeBatchEffect(as.matrix(tempCounts), batch = plate, design = as.matrix(as.numeric(unfactor(factor1))))
+
+#combines all the gene values for all genes into a single list
+temp <- c()
+for(i in 1:dim(normCounts)[1]){
+  temp <- c(temp, normCounts[i, ])
+}
+temp <- as.vector(temp)
+
+#
+cPlot$counts <- temp
+
+graph21L <- cPlot |> ggplot(aes(x = gene, y= counts, fill = condition)) + geom_boxplot(outliers = F) + 
+  labs(
+    title=paste("mRNA Counts for genes of interest"),
+    subtitle = "Limma-voom Batch",
+    y = "log2CPM",
+  )
+```
+
+### Comparison
+
+```{r}
+if (runDESeq){
+  graph2D
+  tDif2D
+}
+
+graph2L
+graph21L
+tDif2L
+```
+
+## BC Patient
+
+Compared DESeq2 and Limma
+
+```{r}
+if(!paired){
+  print("ERROR, paired is FALSE, make TRUE for no error")
+}
+```
+
+### DESeq2 Analysis
+
+```{r}
+if(!paired){
+  
+  if (runDESeq){
+    
+    #Starts counting time
+    time1 = Sys.time()
+    
+    #Uses DESeq2 method to analyze the matrix data
+    dds <- DESeqDataSetFromMatrix(countData = sub_matrix,
+                                  colData = sub_meta,
+                                  design = ~ subject + condition)
+    
+    #Sets normal patients as the control
+    dds$condition <- relevel(dds$condition, ref = "normal")
+    
+    #Prefilters to speed up method
+    temp <- sub_meta |> group_by(condition) |> summarize(n=n())
+    
+    smallestGroupSize <- 3
+    keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+    dds <- dds[keep,]
+    
+    #Used reduced method
+    dds <- DESeq(dds, fitType = "glmGamPoi", test="LRT", reduced = ~subject)
+    
+    res <- results(dds)
+    
+    #Now the results of the genes are plotted
+    
+    #Gathers all plotting points for all genes
+    combBC <- data.frame()
+    for (gene in geneList){
+      combBC <- combBC |> bind_rows(
+      genePlotPoints(gene, dds, res) |> mutate(gene=gene))
+    }
+    
+    combBC <- combBC |> mutate(log2count = log2(count))
+    
+    #plots the values
+    graph3D <- combBC |> ggplot(aes(x=gene, y=log2count, fill=condition))+
+        geom_boxplot(outliers = FALSE) + 
+      labs(
+        title=paste("mRNA Counts for genes of interest"),
+        subtitle = "DESeq2 Patient"
+      )
+    
+    
+    
+    #Ends the time and prints time elapsed
+    
+    time2 = Sys.time()
+    
+    #Prints time elapsed
+    tDif3D <- time2-time1
+  }
+}
+```
+
+### Limma Analysis
+
+```{r}
+if(!paired){
+  
+  #Start time
+  time1 = Sys.time()
+  
+  factor1 <- sub_meta$condition
+  plate <- sub_meta$plate
+  subject <- sub_meta$subject
+  
+  
+  #Makes DGEList object
+  d0 <- DGEList(sub_matrix)
+  
+  #Calculates normalization factors
+  d0 <- calcNormFactors(d0)
+  
+  #Filter low expression genes
+  cutoff <- 3
+  drop <- which(apply(cpm(d0), 1, max) < cutoff)
+  d <- d0[-drop,] 
+  
+  #gets lcpm data
+  logcpm <- cpm(d, prior.count=2, log=TRUE)
+  
+  #Makes design of analysis
+  mm <- model.matrix(~0 + factor1 + subject)
+  
+  #VoomLmFit
+  fit <- voomLmFit(d, mm)
+  fit <- eBayes(fit)
+  
+  cPlot = data.frame()
+  
+  for( gene in geneList){
+    norm <- as.data.frame(fit$EList$E[nameToID(gene), ])
+    norm$condition <- sub_meta$condition
+    norm$gene <- gene
+    
+    colnames(norm) <- c("counts", "condition", "gene")
+    
+    cPlot <- cPlot |> bind_rows(norm)
+  }
+  
+  # #Plotting expression values
+  # norm <- as.data.frame(edgeR::cpm(d)[gene, ]) # to get normalized expression values.
+  # norm$condition <- sub_meta$condition
+  # colnames(norm) <- c("counts", "condition")
+  
+  graph3L <- cPlot |> ggplot(aes(x = gene, y= counts, fill = condition)) + geom_boxplot(outliers = F) + 
+    labs(
+      title=paste("mRNA Counts for genes of interest"),
+      subtitle = "Limma-voom Patient",
+      y = "log2CPM",
+    )
+  
+  #ENd time
+  time2 = Sys.time()
+  
+  tDif3L <- time2-time1
+}
+```
+
+### Comparison
+
+```{r}
+
+if (runDESeq){
+  graph3D
+  tDif3D
+}
+
+graph3L
+tDif3L
+```
+
+## BC Subtype + Patient
+
+Compared DESeq2 and Limma
+
+```{r}
+if(!paired){
+  print("ERROR, paired is FALSE, make TRUE for no error")
+}
+```
+
+### DESeq2 Analysis
+
+```{r}
+if (runDESeq){
+  
+  #Starts counting time
+  time1 = Sys.time()
+  
+  sub_meta_temp <- sub_meta
+  sub_meta_temp$condition <- sub_meta$subtype
+  
+  #Uses DESeq2 method to analyze the matrix data
+  dds <- DESeqDataSetFromMatrix(countData = sub_matrix,
+                                colData = sub_meta_temp,
+                                design = ~ subject + condition)
+  
+  #Sets normal patients as the control
+  dds$condition <- relevel(dds$condition, ref = "normal")
+  
+  #Prefilters to speed up method
+  temp <- sub_meta |> group_by(condition) |> summarize(n=n())
+  
+  smallestGroupSize <- 3
+  keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+  dds <- dds[keep,]
+  
+  #Used reduced method
+  dds <- DESeq(dds, fitType = "glmGamPoi", test="LRT", reduced = ~subject)
+  
+  res <- results(dds)
+  
+  #Now the results of the genes are plotted
+  
+  #Gathers all plotting points for all genes
+  combBC <- data.frame()
+  for (gene in geneList){
+    combBC <- combBC |> bind_rows(
+    genePlotPoints(gene, dds, res) |> mutate(gene=gene))
+  }
+  
+  combBC <- combBC |> mutate(log2count = log2(count))
+  
+  #plots the values
+  graph4D <- combBC |> ggplot(aes(x=gene, y=log2count, fill=condition))+
+      geom_boxplot(outliers = FALSE) + 
+    labs(
+      title=paste("mRNA Counts for genes of interest"),
+      subtitle = "DESeq2 Subtype + Patient"
+    )
+  
+  
+  
+  #Ends the time and prints time elapsed
+  
+  time2 = Sys.time()
+  
+  #Prints time elapsed
+  tDif4D <- time2-time1
+}
+```
+
+### Limma Analysis
+
+```{r}
+#Start time
+time1 = Sys.time()
+
+factor1 <- sub_meta$condition
+subtype <- sub_meta$subtype
+plate <- sub_meta$plate
+subject <- sub_meta$subject
+
+
+#Makes DGEList object
+d0 <- DGEList(sub_matrix)
+
+#Calculates normalization factors
+d0 <- calcNormFactors(d0)
+
+#Filter low expression genes
+cutoff <- 3
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop,] 
+
+#gets lcpm data
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+
+#Makes design of analysis
+mm <- model.matrix(~0 + subtype + subject)
+
+#VoomLmFit
+fit <- voomLmFit(d, mm)
+fit <- eBayes(fit)
+
+cPlot = data.frame()
+
+for( gene in geneList){
+  norm <- as.data.frame(fit$EList$E[nameToID(gene), ])
+  norm$subtype <- sub_meta$subtype
+  norm$gene <- gene
+  
+  colnames(norm) <- c("counts", "subtype", "gene")
+  
+  cPlot <- cPlot |> bind_rows(norm)
+}
+
+cPlot$subtype <- relevel(cPlot$subtype, ref = "normal")
+
+# #Plotting expression values
+# norm <- as.data.frame(edgeR::cpm(d)[gene, ]) # to get normalized expression values.
+# norm$condition <- sub_meta$condition
+# colnames(norm) <- c("counts", "condition")
+
+graph4L <- cPlot |> ggplot(aes(x = gene, y= counts, fill = subtype)) + geom_boxplot(outliers = F) + 
+  labs(
+    title=paste("mRNA Counts for genes of interest"),
+    subtitle = "Limma-voom Subtype + Patient",
+    y = "log2CPM",
+  )
+
+#ENd time
+time2 = Sys.time()
+
+tDif4L <- time2-time1
+```
+
+### Comparison
+
+```{r}
+if (runDESeq){
+  graph4D
+  tDif4D
+}
+
+graph4L
+tDif4L
+```
+
+## Between Group Comparisons
+
+```{r}
+graph1L
+graph2L
+graph3L
+graph4L
+
+graph1D
+graph2D
+graph3D
+graph4D
+
+tDif1L
+tDif2L
+tDif3L
+tDif4L
+
+tDif1D
+tDif2D
+tDif3D
+tDif4D
+```

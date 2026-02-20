@@ -1,0 +1,1847 @@
+---
+title: "ProteomicDB"
+format: html
+editor: visual
+---
+
+# Loading Libraries
+
+```{r}
+#| include: false
+
+library(jsonlite)
+library(httr) #For REST API calls
+library(tidyverse)
+library(ggplot2) #Plotting
+library(DESeq2) #DE Analysis
+library("Biobase") 
+library("gplots")
+library("RColorBrewer") 
+library("pheatmap") #For heat maps and quality control graphs
+library("matrixStats")
+library("lattice")
+library("gtools")
+library("dplyr")
+library(edgeR) #For data analysis and limma
+library("BiocParallel") #For running DESeq2 in parallel
+library(ggsignif)
+library("ggpubr") #Adding significance bars for graphs
+library(limma) #For removing batch effects???
+```
+
+# Loading Data
+
+```{r}
+#Data downloaded from proteomicsDB as the lung expression data
+CD97_1 <- read_delim("data/ProteomicsDB/CD97_P48960.csv")  
+
+```
+
+# Functions
+
+## API Call
+
+Function to get data from an API Call to proteonomicsDB
+
+API Documentation: <https://www.proteomicsdb.org/apiv2>
+
+Returns either a list or dataframe containing the necessary data
+
+```{r}
+getAPIData <- function(uriString){
+  #Turns strings and other special characters into percent encoding to be URL compatible
+  uriSafe <- URLencode(uriString, reserved = FALSE)
+  uriSafe <- str_replace_all(uriSafe, coll("'"), "%27")
+  uriSafe <- str_replace_all(uriSafe, coll("("), "%28")
+  uriSafe <- str_replace_all(uriSafe, coll(")"), "%29")
+  uriSafe <- str_replace_all(uriSafe, coll(" "), "%20")
+  uriSafe <- paste0(substr(uriSafe, start = 1, stop = 8), 
+                    str_replace_all(
+    substr(uriSafe, start = 9, stop = str_length(uriSafe)),
+    coll(":"), "%3A"
+    )
+  )
+
+  #print(uriSafe)
+  
+  #Get the data from the API call
+  res = GET(uriSafe)
+  
+  #Get status code
+  status <- res$status_code
+  
+  #If API call succeeds
+  if(status == 200) {
+    #Calls data
+    data <- fromJSON(rawToChar(res$content))$d
+    
+    #Checks if the returned data has an extra layer
+    if(length(names(data)) == 1)
+      return(data$results)
+    else
+      return(data)
+  } else {
+    print(paste("API CALL FAILED. ERROR CODE", status))
+  }
+}
+
+```
+
+## Protein Name Data
+
+Function to view data associated with a gene name
+
+```{r}
+viewGeneData <- function(gene_name){
+  #URI to API call
+  url <- paste0(
+    "https://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Protein?$format=json&$filter=GENE_NAME eq '",
+    gene_name, 
+    "' and DECOY eq 0")
+  
+  #Replace special characters like " " and "'" with url friendly versions (%20 and %27)
+  data <- getAPIData(url)
+  View(data)
+}
+```
+
+## Name to ID
+
+Function to convert the protein name to the corresponding protein id, as well as the ids for its isoforms
+
+```{r}
+proteinNameToID <- function(gene_name){
+  #makes url for API Call
+    url <- paste0(
+    "https://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Protein?$format=json&$filter=ENTRY_NAME eq '",
+    gene_name, "_HUMAN",
+    "' and DECOY eq 0")
+    
+    #Calls API
+    data <- getAPIData(url)
+    
+    #Returns protein ID for the protein and its isoforms
+    #1st element is canonical form, next entries are the isoforms
+    return(data$PROTEIN_ID)
+}
+```
+
+## Lung
+
+### Single Protein Lung
+
+Function to plot or return data associated with a specific protein in lung samples
+
+Takes the name of protein, dataframes of normal and cancer lung sample data and returns the expression to plot
+
+```{r}
+pointsProteinLung <- function(protein, lung_normal_data, lung_cancer_data){
+  #Allows the function to work with protein names or ids
+  if(class(protein)=="character"){
+    protein_name <- protein
+    protein_id <- proteinNameToID(protein_name)[1]
+  } else {
+    protein_id <- protein
+  }
+  
+  #Iterates through each sample's protein expression data
+  lung_normal_exp_data <- list()
+  
+  #Takes each protein expression API call from each sample and filters for the specific protein
+  for(normLink in lung_normal_data$ProteinExpression$`__deferred`$uri){
+    temp <- list(getAPIData(paste0(normLink, "?$format=json&$filter=PROTEIN_ID eq ", protein_id)))
+    lung_normal_exp_data <- c(lung_normal_exp_data, temp) #List of exp datas
+  }
+  
+  #Combines all the sample expression data together
+  lung_normal_exp_CD97 <- bind_rows(lung_normal_exp_data)
+  
+  #Iterates through each sample's protein expression data
+  lung_cancer_exp_data <- list()
+  for(cancLink in lung_cancer_data$ProteinExpression$`__deferred`$uri){
+    temp <- list(getAPIData(paste0(cancLink, "?$format=json&$filter=PROTEIN_ID eq ", protein_id)))
+    lung_cancer_exp_data <- c(lung_cancer_exp_data, temp)
+  }
+  
+  #Joins all cancer exp data into a data frame
+  lung_cancer_exp_CD97_data <- bind_rows(lung_cancer_exp_data) 
+  
+  #Checks the rest of the list
+  canc_data_list <- list()
+  
+  #Iterates through all other cancer tissues
+  for (tissueType in lung_sample_data[-2]){
+    lung_cancer_exp_data_2 <- list()
+    
+    #Gets protein expression for each cancer tissue type
+    for(cancLink in tissueType$ProteinExpression$`__deferred`$uri){
+      #Get API data
+      temp <- list(getAPIData(paste0(cancLink, 
+                                     "?$format=json&$filter=PROTEIN_ID eq ", protein_id)))
+      lung_cancer_exp_data_2 <- c(lung_cancer_exp_data_2, temp)
+    }
+     #Gets all samples for a specific tissue type and combines into a single data frame
+    lung_cancer_exp_CD97_data_2 <- bind_rows(lung_cancer_exp_data_2)
+    
+    #Adds the dataframe to the list of samples for each tissue type
+    canc_data_list <- c(canc_data_list, list(lung_cancer_exp_CD97_data_2))
+  }
+  
+  #Combine cancer expression dataframes
+  lung_cancer_exp_CD97 <- lung_cancer_exp_CD97_data |>
+    bind_rows(
+      bind_rows(canc_data_list)
+    )
+  
+  #Sets up the points to plot
+  #Choose which set of protein expression to use
+  normal_exp <- lung_normal_exp_CD97 |> filter(CALCULATION_METHOD == calc_method) |> select(EXPRESSION) |> mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  cancer_exp <- lung_cancer_exp_CD97 |> filter(CALCULATION_METHOD == calc_method) |> select(EXPRESSION) |> mutate(condition = "cancer", expression = as.numeric(EXPRESSION))
+  
+  #Combine normal + cancer data
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  #Sets levels
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "cancer"))
+  
+  return(plotData)
+}
+```
+
+Function to plot the points given in the previous section
+
+```{r}
+plotProteinLung <- function(protein_name, lung_normal_data, lung_cancer_data){
+  
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinLung(protein_name, lung_normal_data, lung_cancer_data)
+  
+  #Get number of normal and cancer data points
+  nNormal <- dim(plotData |> filter(condition == "normal"))[1]
+  nCancer <- dim(plotData |> filter(condition == "cancer"))[1]
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = condition, y = expression, fill = condition)) +
+  geom_boxplot() + 
+  labs(
+    title = paste("Protein Expression of", protein_name, " in Lung Cancers"),
+    subtitle = paste0(nNormal, " normal samples, ", nCancer, " cancer samples"),
+  ) + 
+  stat_compare_means(label = "p.signif", comparisons = list(c("normal", "cancer")))
+  
+}
+```
+
+### Multiple Protein Lung
+
+Return points to plot for a series of protein names
+
+```{r}
+pointsProteinListLung <- function(protein_list, lung_normal_data, lung_cancer_data){
+  #Sets up the points to plot
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1]) #1st element is protein
+  
+  #Iterates through each sample's protein expression data
+  lung_normal_exp_data <- list()
+  for(normLink in lung_normal_data$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets the API Call
+    temp <- list(getAPIData(uri))
+    lung_normal_exp_data <- c(lung_normal_exp_data, temp)
+  }
+  
+  #Combines all normal sample data
+  lung_normal_exp <- bind_rows(lung_normal_exp_data)
+  
+  #Selects columns of interest and labels data
+  normal_exp <- lung_normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #Cancer Data
+  #Iterates through each sample's protein expression data
+  lung_cancer_exp_data <- list()
+  for(cancLink in lung_cancer_data$ProteinExpression$`__deferred`$uri){
+    #First part of API Call
+    uri <- paste0(cancLink, "?$format=json&$filter=")
+    
+    #Joins additional filters for each protein id
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets sample data and combines with other sample data
+    temp <- list(getAPIData(uri))
+    lung_cancer_exp_data <- c(lung_cancer_exp_data, temp)
+  }
+  #Combines all sample data into dataframe
+  lung_cancer_exp <- bind_rows(lung_cancer_exp_data)
+  
+  
+  #Checks the rest of the list
+  canc_data_list <- list()
+  
+  #Looks through the other list elements
+  for (tissueType in lung_sample_data[-2]){
+    lung_cancer_exp_data_2 <- list()
+    
+    #Ensures that the lung data isn't treated with anything
+    tissueType <- tissueType |> filter(TREATMENT %in% c("Not applicable/none", ""))
+    
+    #Gets data from each cancer sample
+    for(cancLink in tissueType$ProteinExpression$`__deferred`$uri){
+      uri <- paste0(cancLink, "?$format=json&$filter=")
+      temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+      temp <- paste(temp, collapse = " or ")
+      uri <- paste0(uri, temp)
+    
+      
+      temp <- list(getAPIData(uri))
+      lung_cancer_exp_data_2 <- c(lung_cancer_exp_data_2, temp)
+    }
+    
+    #Combines all cancer sample data
+    lung_cancer_exp_data_2 <- bind_rows(lung_cancer_exp_data_2)
+    
+    canc_data_list <- c(canc_data_list, list(lung_cancer_exp_data_2))
+  }
+  
+  #Combines all the cancer data together into single dataframe
+  lung_cancer_exp <- lung_cancer_exp |>
+    bind_rows(
+      bind_rows(canc_data_list)
+    )
+  
+  #Gets only columns of interest
+  cancer_exp <- lung_cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "cancer", expression = as.numeric(EXPRESSION))
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  #Factors columns
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "cancer"))
+  plotData$PROTEIN_ID <- factor(plotData$PROTEIN_ID)
+  
+  return(plotData)
+}
+```
+
+Plotting Function
+
+```{r}
+plotProteinListLung <- function(protein_list, lung_normal_data, lung_cancer_data, protein_list_name){
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinListLung(protein_list, lung_normal_data, lung_cancer_data)
+  
+  #Gets list of ids for labeling data with protein names
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_list_name[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list_name)
+  
+  #Gets number of samples in each pair of proteins and conditions
+  n <- plotData |> 
+    group_by(protein_name, condition) |> 
+    summarize(n = n()) |> 
+    pivot_wider(names_from=condition, values_from = n) |>
+    mutate(label = paste0(normal,"N\n", cancer,"C"))
+
+  #Get the number of proteins and sample numbers for annotations
+  nProt <- length(protein_list_name)
+  labels <- n$label
+  
+  #Only compare proteins with normal and cancer samples
+  valid_list <- c()
+  for(index in 1:length(protein_list_name)){
+    protein <- protein_list_name[index]
+  
+    plotData_protein <- plotData |> filter(protein_name == protein)
+    levelsPlot <- unique(plotData_protein$condition)
+    if(length(levelsPlot) == 2){
+      valid_list <- c(valid_list, protein)
+    }
+  }
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = protein_name, y = expression, fill = condition)) +
+    geom_boxplot(outliers = F) + 
+    labs(
+    title = paste("Protein Expression in Non-Small Cell Lung Cancer"),
+    x = "Protein Name",
+    y = "Protein Expression"
+  ) + 
+    stat_compare_means(data = plotData |> filter(protein_name %in% valid_list), label = "p.signif") + #Statistical significance
+    theme_classic()
+}
+```
+
+### Combining Isoforms
+
+This gets the protein expression points for the proteins and their isoforms for a list of protein names
+
+```{r}
+pointsProteinListLungIso <- function(protein_list, lung_normal_data, lung_cancer_data){
+  #Sets up the points to plot
+  #Choose which set of protein expression to use
+
+  #Gets list of protein ids to use in api call from the proteins and their isoforms
+  protein_id_list <- c()
+  protein_name_list <- c()
+  for(protein in protein_list)
+  {
+    iso_list <- proteinNameToID(protein)
+    protein_id_list <- c(protein_id_list, iso_list)
+    protein_name_list <- c(protein_name_list, rep(protein, length(iso_list)))
+  }
+  
+  
+  #Iterates through each sample's protein expression data
+  lung_normal_exp_data <- list()
+  for(normLink in lung_normal_data$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets API Call
+    temp <- list(getAPIData(uri))
+    lung_normal_exp_data <- c(lung_normal_exp_data, temp)
+  }
+  
+  lung_normal_exp <- bind_rows(lung_normal_exp_data)
+  
+  #Filters for useful columns and levels data
+  normal_exp <- lung_normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #Cancer Data
+  #Iterates through each sample's protein expression data
+  lung_cancer_exp_data <- list()
+  for(cancLink in lung_cancer_data$ProteinExpression$`__deferred`$uri){
+    #Builds url for API call
+    uri <- paste0(cancLink, "?$format=json&$filter=")
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets and combines API call data
+    temp <- list(getAPIData(uri))
+    lung_cancer_exp_data <- c(lung_cancer_exp_data, temp)
+  }
+  
+  #Combines cancer data into a dataframe
+  lung_cancer_exp <- bind_rows(lung_cancer_exp_data)
+  
+  
+  #Checks the rest of the list
+  canc_data_list <- list()
+  
+  #Looks through the other list elements
+  for (tissueType in lung_sample_data[-2]){
+    lung_cancer_exp_data_2 <- list()
+    
+    for(cancLink in tissueType$ProteinExpression$`__deferred`$uri){
+      uri <- paste0(cancLink, "?$format=json&$filter=")
+      temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+      temp <- paste(temp, collapse = " or ")
+      uri <- paste0(uri, temp)
+    
+      temp <- list(getAPIData(uri))
+      lung_cancer_exp_data_2 <- c(lung_cancer_exp_data_2, temp)
+    }
+    
+    lung_cancer_exp_data_2 <- bind_rows(lung_cancer_exp_data_2)
+    
+    canc_data_list <- c(canc_data_list, list(lung_cancer_exp_data_2))
+  }
+  
+  #Combines all cancer data into single dataframe
+  lung_cancer_exp <- lung_cancer_exp |>
+    bind_rows(
+      bind_rows(canc_data_list)
+    )
+  
+  #Filters for useful columns
+  cancer_exp <- lung_cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "cancer", expression = as.numeric(EXPRESSION))
+  
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "cancer"))
+  plotData$PROTEIN_ID <- factor(plotData$PROTEIN_ID)
+  
+  return(plotData)
+}
+```
+
+Plotting Function
+
+```{r}
+plotProteinListLungIso <- function(protein_list, lung_normal_data, lung_cancer_data){
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinListLungIso(protein_list, lung_normal_data, lung_cancer_data)
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- c()
+  protein_name_list <- c()
+  for(protein in protein_list)
+  {
+    iso_list <- proteinNameToID(protein)
+    protein_id_list <- c(protein_id_list, iso_list)
+    protein_name_list <- c(protein_name_list, rep(protein, length(iso_list)))
+  }
+  
+  #Labels each data point with the protein name
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_name_list[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list)
+  
+  #Gets number of data points for each pair of proteins and conditions
+  n <- plotData |> 
+    group_by(protein_name, condition) |> 
+    summarize(n = n()) |> 
+    pivot_wider(names_from=condition, values_from = n) |>
+    mutate(label = paste0(normal,"N\n", cancer,"C"))
+
+  #Gets data for annotations
+  nProt <- length(protein_list)
+  labels <- n$label
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = protein_name, y = expression, fill = condition)) +
+    geom_boxplot() + 
+    labs(
+    title = paste("Protein Expression with Isoforms in Lung Cancers"),
+  ) + 
+    stat_compare_means(label = "p.signif") +
+    annotate("text", x=1:nProt, y=4, label=labels)
+  
+}
+```
+
+### Subtype Single
+
+```{r}
+pointsProteinLungSubtype <- function(protein_name, lung_normal_data, lung_cancer_list, subtype_list){
+  
+  protein_id <- proteinNameToID(protein_name)[1]
+  
+  #Iterates through each sample's protein expression data
+  lung_normal_exp_data <- list()
+  
+  #Takes each protein expression API call from each sample and filters for the specific protein
+  for(normLink in lung_normal_data$ProteinExpression$`__deferred`$uri){
+    temp <- list(getAPIData(paste0(normLink, "?$format=json&$filter=PROTEIN_ID eq ", protein_id)))
+    lung_normal_exp_data <- c(lung_normal_exp_data, temp) #List of exp datas
+  }
+  
+  #Combines all the sample expression data together
+  lung_normal_exp <- bind_rows(lung_normal_exp_data)
+  #View(lung_normal_exp |> filter(CALCULATION_METHOD == calc_method))
+  
+  
+  #Iterates through each sample's protein expression data
+  lung_cancer_exp <- data.frame()
+  
+  for(i in 1:length(subtype_list)){
+    subtype <- subtype_list[i]
+    sample_cancer_data <- lung_cancer_list[[i]]
+    
+    lung_subtype_exp <- data.frame()
+
+    for(cancLink in sample_cancer_data$ProteinExpression$`__deferred`$uri){
+      temp <- as.data.frame(getAPIData(paste0(cancLink, "?$format=json&$filter=PROTEIN_ID eq ", protein_id)))
+      lung_subtype_exp <- bind_rows(lung_subtype_exp, temp)
+    }
+    
+    lung_subtype_exp <- lung_subtype_exp |> mutate(condition = subtype)
+    
+    lung_cancer_exp <- lung_cancer_exp |> bind_rows(lung_subtype_exp)
+  }
+  #View(lung_cancer_exp |> filter(CALCULATION_METHOD == calc_method))
+
+  
+  #Sets up the points to plot
+  #Choose which set of protein expression to use
+  normal_exp <- lung_normal_exp |> filter(CALCULATION_METHOD == calc_method) |> select(EXPRESSION, SAMPLE_ID) |> mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  cancer_exp <- lung_cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, condition, SAMPLE_ID) |> mutate(expression = as.numeric(EXPRESSION))
+  
+  #Combine normal + cancer data
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  #Sets levels
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "adeno", "squamous", "large cell"))
+  
+  levels(plotData$condition) <- c("normal", "adenocarcinoma", "squamous", "large cell")
+  
+  return(plotData)
+}
+```
+
+Plotting
+
+```{r}
+plotProteinLungSubtype <- function(protein_name, lung_normal_data, lung_cancer_list, subtype_list){
+  
+  plotData <- pointsProteinLungSubtype(protein_name, lung_normal_data, lung_cancer_list, subtype_list)
+  
+  comps <- list(
+    c("normal", "adenocarcinoma"),
+    c("normal", "squamous"),
+    c("normal", "large cell")
+  )
+
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = condition, y = expression, fill = condition)) +
+    geom_boxplot(outliers = F) + 
+    labs(
+    title = paste(protein_name, "Protein Expression in Non-Small Lung Cancer Subtypes"),
+    x = "condition",
+    y = "protein expression"
+  ) + 
+    geom_signif(
+      comparisons = comps,
+      map_signif_level  = T,
+      step_increase = 0.08,
+      test.args = list(paired = F)
+    ) 
+}
+```
+
+### Subtype List
+
+Points
+
+```{r}
+pointsProteinListLungSubtype <- function(protein_list, lung_normal_data, lung_cancer_list, subtype_list){
+  
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  #Iterates through each sample's protein expression data
+  lung_normal_exp_data <- list()
+  
+  #Takes each protein expression API call from each sample and filters for the specific protein
+  for(normLink in lung_normal_data$ProteinExpression$`__deferred`$uri){
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    temp <- list(getAPIData(uri))
+    lung_normal_exp_data <- c(lung_normal_exp_data, temp) #List of exp datas
+  }
+  
+  #Combines all the sample expression data together
+  lung_normal_exp <- bind_rows(lung_normal_exp_data)
+  #View(lung_normal_exp |> filter(CALCULATION_METHOD == calc_method))
+  
+  
+  #Iterates through each sample's protein expression data
+  lung_cancer_exp <- data.frame()
+  
+  for(i in 1:length(subtype_list)){
+    subtype <- subtype_list[i]
+    sample_cancer_data <- lung_cancer_list[[i]]
+    
+    lung_subtype_exp <- data.frame()
+
+    for(cancLink in sample_cancer_data$ProteinExpression$`__deferred`$uri){
+      uri <- paste0(cancLink, "?$format=json&$filter=")
+      #Joins filters for each protein ID
+      temp <- sapply(protein_id_list, 
+                     function(data) paste0("PROTEIN_ID eq ", data)
+                     )
+      #Joins them together
+      temp <- paste(temp, collapse = " or ")
+      uri <- paste0(uri, temp)
+      
+      temp <- as.data.frame(getAPIData(uri))
+      lung_subtype_exp <- bind_rows(lung_subtype_exp, temp)
+    }
+    
+    lung_subtype_exp <- lung_subtype_exp |> mutate(condition = subtype)
+    
+    lung_cancer_exp <- lung_cancer_exp |> bind_rows(lung_subtype_exp)
+  }
+  #View(lung_cancer_exp |> filter(CALCULATION_METHOD == calc_method))
+
+  
+  #Sets up the points to plot
+  #Choose which set of protein expression to use
+  normal_exp <- lung_normal_exp |> filter(CALCULATION_METHOD == calc_method) |> select(EXPRESSION, PROTEIN_ID, SAMPLE_ID) |> mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  cancer_exp <- lung_cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION,  PROTEIN_ID, condition, SAMPLE_ID) |> mutate(expression = as.numeric(EXPRESSION))
+  
+  #Combine normal + cancer data
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  #Sets levels
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "adeno", "squamous", "large cell"))
+  
+  levels(plotData$condition) <- c("normal", "adenocarcinoma", "squamous", "large cell")
+  
+  return(plotData)
+}
+```
+
+Plot
+
+```{r}
+plotProteinListLungSubtype <- function(protein_list, lung_normal_data, lung_cancer_list, subtype_list, protein_list_name){
+  
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  plotData <- pointsProteinListLungSubtype(protein_list, lung_normal_data, lung_cancer_list, subtype_list)
+  
+  
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_list_name[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list_name)
+  
+  
+  #Gets different conditions in proper order
+  condLevels <- levels(plotData$condition)
+  
+  #Makes an interaction that gives every combination between protein and condition to label each box plot
+  plotData$interaction <- factor(
+    interaction(plotData$protein_name, plotData$condition), 
+    levels = c(t(sapply(condLevels, function(d) paste(protein_list_name, d, sep="."))))#Orders the factor levels for boxplot
+    )
+  
+  #Generates labels for the x axis by making a central boxplot have the protein name and keeping the others blank
+  xlabels <- c()
+  for(protein in protein_list_name){
+    xlabels <- c(xlabels, " ", protein, " ", " ")
+  }
+  
+  #Creates list of comparisons to make by for each protein, getting the comparisons to be made
+  temp <- as.data.frame(sapply(condLevels, function (d) paste(protein_list_name, d, sep=".")))
+  comps <- list()
+  for(i in 1:length(protein_list_name)){
+    temp1 <- list(c(temp[i, "normal"], temp[i, "adenocarcinoma" ]), 
+                  c(temp[i, "normal"], temp[i, "squamous" ]),
+                  c(temp[i, "normal"], temp[i, "large cell" ])
+                  )
+    comps <- c(comps, temp1)
+  }
+
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = interaction, y = expression, fill = condition)) +
+    scale_x_discrete(
+      labels = xlabels 
+    ) +
+    geom_boxplot(outliers = F) + 
+    labs(
+    title = paste("Protein Expression in NSCLC Subtypes"),
+    x = "Protein Name",
+    y="Protein Expression"
+  ) + 
+    geom_signif(
+      comparisons = comps,
+      map_signif_level  = T,
+      y_position = c(rep(c(10, 10.5, 11), 6))
+    ) + 
+    theme_classic()
+  
+}
+```
+
+## Breast
+
+### Multiple Proteins
+
+Takes a list of proteins (can be a single protein) along with the data frame of normal and cancerous breast cancer samples and returns protein expressions to plot
+
+```{r}
+pointsProteinList <- function(protein_list, normal_samples, cancer_samples){
+  #Sets up the points to plot
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  #count <- 1
+  
+  #Iterates through each sample's protein expression data
+  normal_exp_data <- list()
+  for(normLink in normal_samples$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets API Call
+    temp <- list(getAPIData(uri))
+    normal_exp_data <- c(normal_exp_data, temp)
+    
+    #count <- count +1
+    #print(count) #FOR DEBUGGING
+  }
+  
+  normal_exp <- bind_rows(normal_exp_data)
+  
+  #Filters for useful columns
+  normal_exp <- normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID, CALCULATION_METHOD) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #Cancer Data
+  #Iterates through each sample's protein expression data
+  cancer_exp_data <- list()
+  for(cancLink in cancer_samples$ProteinExpression$`__deferred`$uri){
+    uri <- paste0(cancLink, "?$format=json&$filter=")
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    temp <- list(getAPIData(uri))
+    cancer_exp_data <- c(cancer_exp_data, temp)
+    
+    #count <- count + 1
+    #print(count) #FOR DEBUGGING
+  }
+  
+  #Combines cancer data and filters for useful columns
+  cancer_exp <- bind_rows(cancer_exp_data)
+  
+  cancer_exp <- cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID, CALCULATION_METHOD) |> 
+    mutate(condition = "cancer", expression = as.numeric(EXPRESSION))
+  
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "cancer"))
+  plotData$PROTEIN_ID <- factor(plotData$PROTEIN_ID)
+  
+  return(plotData)
+}
+```
+
+Plotting
+
+```{r}
+plotProteinList <- function(protein_list, normal_samples, cancer_samples, protein_list_name){
+  
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinList(protein_list, normal_samples, cancer_samples)
+  
+  #Gets list of protein ids and labels each data point with protein name
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_list_name[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list_name)
+  
+  #Gets number of data points for each pair of proteins and conditions
+  n <- plotData |> 
+    group_by(protein_name, condition) |> 
+    summarize(n = n()) |> 
+    pivot_wider(names_from=condition, values_from = n) |>
+    mutate(label = paste0(normal,"N\n", cancer,"C"))
+
+  nProt <- length(protein_list)
+  labels <- n$label
+  
+  #Only compare proteins with normal and cancer samples
+  valid_list <- c()
+  for(index in 1:length(protein_list_name)){
+    protein <- protein_list_name[index]
+  
+    plotData_protein <- plotData |> filter(protein_name == protein)
+    levelsPlot <- unique(plotData_protein$condition)
+    if(length(levelsPlot) == 2){
+      valid_list <- c(valid_list, protein)
+    }
+  }
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = protein_name, y = expression, fill = condition)) +
+    geom_boxplot(outliers = F) + 
+    labs(
+    title = paste("Protein Expression in Breast Cancer"),
+    x = "Protein Name",
+    y = "Protein Expression"
+  ) + 
+    stat_compare_means(data = plotData |> filter(protein_name %in% valid_list), test = "wilcox.test", label = "p.signif") + 
+    theme_classic()
+}
+```
+
+### Isoforms Combine
+
+```{r}
+pointsProteinListIso <- function(protein_list, normal_samples, cancer_samples){
+  #Sets up the points to plot
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- c()
+  protein_name_list <- c()
+  for(protein in protein_list)
+  {
+    iso_list <- proteinNameToID(protein)
+    protein_id_list <- c(protein_id_list, iso_list)
+    protein_name_list <- c(protein_name_list, rep(protein, length(iso_list)))
+  }
+  
+  #Iterates through each sample's protein expression data
+  normal_exp_data <- list()
+  for(normLink in normal_samples$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets API Call
+    temp <- list(getAPIData(uri))
+    normal_exp_data <- c(normal_exp_data, temp)
+  }
+  
+  normal_exp <- bind_rows(normal_exp_data)
+  
+  
+  normal_exp <- normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #Cancer Data
+  #Iterates through each sample's protein expression data
+  cancer_exp_data <- list()
+  for(cancLink in cancer_samples$ProteinExpression$`__deferred`$uri){
+    uri <- paste0(cancLink, "?$format=json&$filter=")
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    temp <- list(getAPIData(uri))
+    cancer_exp_data <- c(cancer_exp_data, temp)
+  }
+  
+  cancer_exp <- bind_rows(cancer_exp_data)
+  
+  cancer_exp <- cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "cancer", expression = as.numeric(EXPRESSION))
+  
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "cancer"))
+  plotData$PROTEIN_ID <- factor(plotData$PROTEIN_ID)
+  
+  return(plotData)
+}
+```
+
+Plotting
+
+```{r}
+plotProteinListIso <- function(protein_list, normal_samples, cancer_samples){
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinListIso(protein_list, normal_samples, cancer_samples)
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- c()
+  protein_name_list <- c()
+  for(protein in protein_list)
+  {
+    iso_list <- proteinNameToID(protein)
+    protein_id_list <- c(protein_id_list, iso_list)
+    protein_name_list <- c(protein_name_list, rep(protein, length(iso_list)))
+  }
+  
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_name_list[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list)
+  
+  n <- plotData |> 
+    group_by(protein_name, condition) |> 
+    summarize(n = n()) |> 
+    pivot_wider(names_from=condition, values_from = n) |>
+    mutate(label = paste0(normal,"N\n", cancer,"C"))
+
+  nProt <- length(protein_list)
+  labels <- n$label
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = protein_name, y = expression, fill = condition)) +
+    geom_boxplot() + 
+    labs(
+    title = paste("Protein Expression with Isoforms in Breast Cancers"),
+  ) + 
+    stat_compare_means(label = "p.signif") +
+    annotate("text", x=1:nProt, y=4, label=labels)
+  
+}
+```
+
+### Subtype Single Protein
+
+Points
+
+```{r}
+pointsProteinSubtype <- function(protein_name, normal_samples, cancer_samples){
+  #Sets up the points to plot
+  
+  #Gets list of protein ids to use in api call
+  protein_id <- proteinNameToID(protein_name)[1]
+  
+  #Iterates through each sample's protein expression data
+  normal_exp_data <- list()
+  for(normLink in normal_samples$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=PROTEIN_ID eq ", protein_id)
+    
+    #Gets API Call
+    temp <- list(getAPIData(uri))
+    normal_exp_data <- c(normal_exp_data, temp)
+  }
+  
+  #Combines all the expression data together into a single data frame
+  normal_exp <- bind_rows(normal_exp_data)
+  
+  #Filters out only exp data from a specific calculation method and only selects relevant columns
+  normal_exp <- normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #Cancer Data
+  #Iterates through each sample's protein expression data
+  cancer_exp_data <- list()
+  
+  nCanc <- dim(cancer_samples)[1]
+  
+  #Iterates through each cancer sample
+  for(index in 1:nCanc){
+    cancLink <- cancer_samples[index, ]$ProteinExpression$`__deferred`$uri
+    
+    uri <- paste0(cancLink, "?$format=json&$filter=PROTEIN_ID eq ", protein_id)
+    
+    uriData <- as.data.frame(getAPIData(uri)) |> mutate(
+      condition = cancer_samples[index, ]$subtype
+    )
+    
+    temp <- list(uriData)
+    cancer_exp_data <- c(cancer_exp_data, temp)
+  }
+  
+  #Combines cancer data and filters useful columns
+  cancer_exp <- bind_rows(cancer_exp_data)
+  
+  cancer_exp <- cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, condition) |> 
+    mutate(expression = as.numeric(EXPRESSION))
+  
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "ERPR", "HER2", "TN"))
+  
+  levels(plotData$condition) <- c("normal", "ERPR", "HER2", "TNBC")
+
+  return(plotData)
+}
+```
+
+Plotting
+
+```{r}
+plotProteinSubtype <- function(protein_name, normal_samples, cancer_samples){
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinSubtype(protein_name, normal_samples, cancer_samples)
+  
+  comps <- list(
+    c("normal", "ERPR"),
+    c("normal", "HER2"),
+    c("normal", "TNBC")
+  )
+
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = condition, y = expression, fill = condition)) +
+    geom_boxplot(outliers = F) + 
+    labs(
+      title = paste(protein_name, "Protein Expression in Breast Cancer Subtypes"),
+      x = "condition",
+      y = "protein expression"
+    ) + 
+    geom_signif(
+      comparisons = comps,
+      map_signif_level  = T,
+      test.args = list(paired = F),
+      step_increase = 0.08,
+    )
+}
+```
+
+### Subtype
+
+```{r}
+pointsProteinListSubtype <- function(protein_list, normal_samples, cancer_samples){
+  #Sets up the points to plot
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  #Iterates through each sample's protein expression data
+  normal_exp_data <- list()
+  for(normLink in normal_samples$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #Gets API Call
+    temp <- list(getAPIData(uri))
+    normal_exp_data <- c(normal_exp_data, temp)
+  }
+  
+  #Combines all the expression data together into a single data frame
+  normal_exp <- bind_rows(normal_exp_data)
+  
+  #Filters out only exp data from a specific calculation method and only selects relevant columns
+  normal_exp <- normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #Cancer Data
+  #Iterates through each sample's protein expression data
+  cancer_exp_data <- list()
+  
+  nCanc <- dim(cancer_samples)[1]
+  
+  #Iterates through each cancer sample
+  for(index in 1:nCanc){
+    cancLink <- cancer_samples[index, ]$ProteinExpression$`__deferred`$uri
+    
+    uri <- paste0(cancLink, "?$format=json&$filter=")
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    uriData <- getAPIData(uri) |> mutate(
+      condition = cancer_samples[index, ]$subtype
+    )
+    
+    temp <- list(uriData)
+    cancer_exp_data <- c(cancer_exp_data, temp)
+  }
+  
+  #Combines cancer data and filters useful columns
+  cancer_exp <- bind_rows(cancer_exp_data)
+  
+  cancer_exp <- cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID, condition) |> 
+    mutate(expression = as.numeric(EXPRESSION))
+  
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "ERPR", "HER2", "TN"))
+  plotData$PROTEIN_ID <- factor(plotData$PROTEIN_ID)
+  
+  return(plotData)
+}
+```
+
+Plotting
+
+```{r}
+plotProteinListSubtype <- function(protein_list, normal_samples, cancer_samples, protein_list_name){
+  
+  protein_id_list <- sapply(protein_list, function(data) proteinNameToID(data)[1])
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinListSubtype(protein_list, normal_samples, cancer_samples)
+  
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_list_name[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list_name)
+  
+  #Gets different conditions in proper order
+  condLevels <- levels(plotData$condition)
+  
+  #Makes an interaction that gives every combination between protein and condition to label each box plot
+  plotData$interaction <- factor(
+    interaction(plotData$protein_name, plotData$condition), 
+    levels = c(t(sapply(condLevels, function(d) paste(protein_list_name, d, sep="."))))#Orders the factor levels for boxplot
+    )
+  
+  #Generates labels for the x axis by making a central boxplot have the protein name and keeping the others blank
+  xlabels <- c()
+  for(protein in protein_list_name){
+    xlabels <- c(xlabels, " ", protein, " ", " ")
+  }
+  
+  #Only compare proteins with normal and cancer samples
+  valid_list <- c()
+  for(index in 1:length(protein_list_name)){
+    protein <- protein_list_name[index]
+  
+    plotData_protein <- plotData |> filter(protein_name == protein)
+    levelsPlot <- unique(plotData_protein$condition)
+    if(length(levelsPlot) == 4){
+      valid_list <- c(valid_list, protein)
+    }
+  }
+  
+  nProt <- length(valid_list)
+  
+  #Creates list of comparisons to make by for each protein, getting the comparisons to be made
+  temp <- as.data.frame(sapply(condLevels, function (d) paste(valid_list, d, sep=".")))
+  comps <- list()
+  for(i in 1:length(valid_list)){
+    temp1 <- list(c(temp[i, "normal"], temp[i, "ERPR"]), 
+                  c(temp[i, "normal"], temp[i, "HER2"]),
+                  c(temp[i, "normal"], temp[i, "TN"])
+                  )
+    comps <- c(comps, temp1)
+  }
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = interaction, y = expression, fill = condition)) +
+    scale_x_discrete(
+      labels = xlabels 
+    ) +
+    geom_boxplot(outliers = F) + 
+    labs(
+    title = "Protein Expression in Breast Cancer Subtypes",
+    x = "Protein Name",
+    y = "Protein Expression"
+  ) + 
+    geom_signif(
+      data = plotData |> filter(protein_name %in% valid_list),
+      comparisons = comps,
+      map_signif_level  = T,
+      y_position = c(rep(c(10, 10.4, 10.8), nProt)),
+    ) + 
+    theme_classic()
+  
+}
+```
+
+### Subtype Isoform
+
+```{r}
+pointsProteinListIsoSubtype <- function(protein_list, normal_samples, cancer_samples){
+  #Sets up the points to plot
+  
+  #Gets list of protein ids to use in api call
+  protein_id_list <- c()
+  protein_name_list <- c()
+  for(protein in protein_list)
+  {
+    iso_list <- proteinNameToID(protein)
+    protein_id_list <- c(protein_id_list, iso_list)
+    protein_name_list <- c(protein_name_list, rep(protein, length(iso_list)))
+  }
+  
+  #count <- 1
+  
+  #Iterates through each sample's protein expression data
+  normal_exp_data <- list()
+  for(normLink in normal_samples$ProteinExpression$`__deferred`$uri){
+    #Makes the first part of the API URI
+    uri <- paste0(normLink, "?$format=json&$filter=")
+    #Joins filters for each protein ID
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    #Joins them together
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    #GEta API Call
+    temp <- list(getAPIData(uri))
+    normal_exp_data <- c(normal_exp_data, temp)
+    
+    #count <- count +1
+    #print(count)
+  }
+  
+  normal_exp <- bind_rows(normal_exp_data)
+  
+  
+  normal_exp <- normal_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID) |> 
+    mutate(condition = "normal", expression = as.numeric(EXPRESSION))
+  
+  #CAncer Data
+  #Iterates through each sample's protein expression data
+  cancer_exp_data <- list()
+  
+  nCanc <- dim(cancer_samples)[1]
+  
+  for(index in 1:nCanc){
+    cancLink <- cancer_samples[index, ]$ProteinExpression$`__deferred`$uri
+    
+    uri <- paste0(cancLink, "?$format=json&$filter=")
+    temp <- sapply(protein_id_list, 
+                   function(data) paste0("PROTEIN_ID eq ", data)
+                   )
+    temp <- paste(temp, collapse = " or ")
+    uri <- paste0(uri, temp)
+    
+    uriData <- getAPIData(uri) |> mutate(
+      condition = cancer_samples[index, ]$subtype
+    )
+    
+    temp <- list(uriData)
+    cancer_exp_data <- c(cancer_exp_data, temp)
+    
+    #count <- count + 1
+    #print(count)
+  }
+  
+  cancer_exp <- bind_rows(cancer_exp_data)
+  
+  
+  
+  cancer_exp <- cancer_exp |> 
+    filter(CALCULATION_METHOD == calc_method) |> 
+    select(EXPRESSION, PROTEIN_ID, condition) |> 
+    mutate(expression = as.numeric(EXPRESSION))
+  
+  
+  plotData <- bind_rows(normal_exp, cancer_exp)
+  
+  plotData$condition <- factor(plotData$condition, levels = c("normal", "ERPR", "HER2", "TN"))
+  plotData$PROTEIN_ID <- factor(plotData$PROTEIN_ID)
+  
+  return(plotData)
+}
+```
+
+Plotting
+
+```{r}
+plotProteinListIsoSubtype <- function(protein_list, normal_samples, cancer_samples){
+  
+  #Gets data to plot the ponts
+  plotData <- pointsProteinListIsoSubtype(protein_list, normal_samples, cancer_samples)
+  
+
+  #Gets list of protein ids to use in api call
+  protein_id_list <- c()
+  protein_name_list <- c()
+  for(protein in protein_list)
+  {
+    iso_list <- proteinNameToID(protein)
+    protein_id_list <- c(protein_id_list, iso_list)
+    protein_name_list <- c(protein_name_list, rep(protein, length(iso_list)))
+  }
+  
+  plotData$protein_name <- sapply(plotData$PROTEIN_ID, 
+                 function(data) protein_name_list[which(data == protein_id_list)])
+  
+  plotData$protein_name <- factor(plotData$protein_name, levels = protein_list)
+  
+  n <- plotData |>
+    group_by(protein_name, condition) |>
+    summarize(n = n()) |>
+    pivot_wider(names_from=condition, values_from = n) |>
+    mutate(label = paste0(normal,"N ", ERPR,"EP\n", HER2,"H2 ", TN,"TN"))
+
+  nProt <- length(protein_list)
+  labels <- n$label
+  
+  
+  #Gets different conditions in proper order
+  condLevels <- levels(plotData$condition)
+  
+  #Makes an interaction that gives every combination between protein and condition to label each box plot
+  plotData$interaction <- factor(interaction(plotData$protein_name, plotData$condition), levels = c(t(sapply(condLevels, function(d) paste(protein_list, d, sep=".")))))
+  
+  #Generates labels for the x axis by making a central boxplot have the protein name and keeping the others blank
+  xlabels <- c()
+  for(protein in protein_list){
+    xlabels <- c(xlabels, " ", protein, " ", " ")
+  }
+  
+    #Creates list of comparisons to make by for each protein, getting the comparisons to be made
+  temp <- as.data.frame(sapply(condLevels, function (d) paste(protein_list, d, sep=".")))
+  comps <- list()
+  for(i in 1:length(protein_list)){
+    temp1 <- list(c(temp[i, "normal"], temp[i, "ERPR"]), 
+                  c(temp[i, "normal"], temp[i, "HER2"]),
+                  c(temp[i, "normal"], temp[i, "TN"])
+                  )
+    comps <- c(comps, temp1)
+  }
+  
+  #Plots the points in a boxplot
+  plotData |> ggplot(aes(x = interaction, y = expression, fill = condition)) +
+    scale_x_discrete(
+      labels = xlabels #x axis labels
+    ) +
+    geom_boxplot() + 
+    labs(
+    title = paste("Protein Expression with Isoforms in Breast Cancer Subtypes"),
+    x = "protein name"
+  ) + 
+    geom_signif( #The significance bars between boxplots
+      comparisons = comps,
+      map_signif_level  = T,
+      y_position = c(rep(c(10, 10.5, 11), nProt)), #Sets the y levels of the signif
+      vjust = 0.5
+    ) +
+    annotate("text", x= 2+4*(0:(nProt-1)), y=5, label=labels) + #num of data points
+    coord_cartesian(ylim = c(4, 11.7))
+  
+}
+```
+
+# Control Variables
+
+```{r}
+#List of proteins to analyze
+protein_list <- c("CD97", "CD109", "CD151", "CD166", "CD276", "EPCAM")
+full_protein_list <- c("CD9", "CD97", "CD109", "MUC18","CD151", "CD166", "CD276", "EPCAM")
+
+half_1_protein_list <- c("CD9", "CD97", "CD109", "MUC18")
+half_2_protein_list <- c("CD151", "CD166", "CD276", "EPCAM", "FGFR4")
+
+half_1_protein_name <- c("CD9", "CD97", "CD109", "CD146")
+half_2_protein_name <- c("CD151", "CD166", "CD276", "EPCAM", "FGFR4")
+#Picks calculation method used in protein expression (can give slightly different values)
+calc_method = 1
+
+BC_protein_list <- c("CD9", "CD151", "CD276", "EPCAM")
+NSCLC_protein_list <- c("CD109", "CD166", "CD276", "EPCAM")
+
+BC_protein_name <- c("CD9", "CD151", "CD276", "EPCAM")
+NSCLC_protein_name <- c("CD109", "CD166", "CD276", "EPCAM")
+```
+
+# API Call to Proteonomics DB
+
+Maybe it would be easier to go top down
+
+Gets Lung Tissue Data from API calls
+
+```{r}
+tissue_data <- getAPIData("https://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Tissue?$format=json")
+
+#Gets all the tissues associated  with the lung and their correesponding links to associated samples
+lung_data <- tissue_data |> filter(SAP_SYNONYM == "lung")
+
+#Gets other cancer data from manual searching
+cancer_lung_tissues <- tissue_data |> filter(SAP_SYNONYM != "lung" & grepl("lung", NAME) & (grepl("cancer", NAME) | grepl("carcinoma", NAME) ) & TISSUE_ID != "BTO:0000189" & TISSUE_ID != "BTO:0002206")
+
+
+lung_data <- bind_rows(lung_data, cancer_lung_tissues)
+
+#iterated through each sample to get their data
+lung_sample_data <- list()
+for(sampLink in lung_data$Sample$`__deferred`$uri){
+  temp <- list(getAPIData(paste0(sampLink, "?$format=json")))
+  lung_sample_data <- c(lung_sample_data, temp)
+}
+
+#Removes empty elements
+lung_sample_data <- Filter(length, lung_sample_data)
+
+#Manual Sorting
+#Normal Expression
+# The second list element is labeled "lung", so it could have normal samples compared to the other elements from cancer cell lines
+lung_lung_data <- lung_sample_data[[2]]
+
+#Filters for non-diseased samples and only selects relevant columns
+lung_normal_data <- lung_lung_data |> filter(DISEASE == "", TAXCODE == 9606)
+
+
+#Cancer Data
+#Cancer data from tissue data
+lung_cancer_data <- lung_lung_data |> filter(DISEASE != "", TAXCODE == 9606)
+
+```
+
+Now to plot the protein expression data in a boxplot
+
+```{r}
+
+# CD97isoforms <- proteinNameToID("CD97")
+# 
+# plotProteinLung("CD97", lung_normal_data, lung_cancer_data)
+# 
+# plotProteinLung(CD97isoforms[2], lung_normal_data, lung_cancer_data)
+# 
+# plotProteinLung(CD97isoforms[3], lung_normal_data, lung_cancer_data)
+# 
+# plotProteinListLungIso(c("CD97"), lung_normal_data, lung_cancer_data)
+
+
+```
+
+Now for a different protein
+
+```{r}
+# #CD109
+# protein_id = 67842
+# 
+# CD109isoforms <- proteinNameToID("CD109")
+# 
+# plotProteinLung("CD109", lung_normal_data, lung_cancer_data)
+# 
+# plotProteinLung(CD109isoforms[2], lung_normal_data, lung_cancer_data)
+
+```
+
+The protein expressions for the proteins of interest are plotted in a boxplot
+
+```{r}
+#plotProteinListLung(protein_list, lung_normal_data, lung_cancer_data)
+
+#plotProteinListLungIso(protein_list, lung_normal_data, lung_cancer_data)
+
+#plotProteinListLung(protein_list, lung_normal_data, lung_cancer_data)
+
+#plotProteinListLungIso(tmp_protein_list, lung_normal_data, lung_cancer_data)
+
+
+plotProteinListLung(half_1_protein_list, lung_normal_data, lung_cancer_data, half_1_protein_name)
+plotProteinListLung(half_2_protein_list, lung_normal_data, lung_cancer_data, half_2_protein_name)
+
+#plotProteinListLungIso(half_1_protein_list, lung_normal_data, lung_cancer_data)
+#plotProteinListLungIso(half_2_protein_list, lung_normal_data, lung_cancer_data)
+```
+
+### Subtype
+
+```{r}
+#fje
+adeno_data <- tissue_data |> filter(
+  (grepl("lung", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM))) & 
+    grepl("adeno", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM))) & 
+    !grepl("mouse", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM)))) |
+    NAME %in% c("A-549 cell", "NCI-H322M cell")
+)
+
+squamous_data <- tissue_data |> filter(
+  (grepl("lung", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM))) & 
+    grepl("squamous", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM))) & 
+    !grepl("mouse", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM)))) |
+    NAME %in% c("NCI-H226 cell")
+)
+
+LLC_data <- tissue_data |> filter(
+  (grepl("large cell", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM))) & 
+    grepl("lung", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM))) & 
+    !grepl("mouse", str_to_lower(paste(NAME, DEFINITION, SYNONYM, SAP_SYNONYM)))) |
+    NAME %in% c("NCI-H460 cell")
+)
+
+
+lung_cancer_list <- list(adeno_data, squamous_data, LLC_data)
+lung_subtype_list <- c("adeno", "squamous", "large cell")
+
+  #DEBUGGING
+  sample_list <- list()
+  for(subtype in lung_cancer_list)
+  {
+    subtype_sample <- data.frame()
+    for(link in subtype$Sample$`__deferred`$uri){
+      temp <- as.data.frame(getAPIData(paste0(link, "?$format=json")))
+      subtype_sample <- bind_rows(subtype_sample, temp)
+    }
+    sample_list <- c(sample_list, list(subtype_sample))
+  }
+  
+  #Samples show that samples from a specific project (Procancer 949 cell lines) have consistently low protein expressions across all proteins, so will be excluded
+  for(i in 1:length(sample_list)){
+    sample_list[[i]] <- sample_list[[i]] |> 
+      filter(TREATMENT == "" | grepl("none", TREATMENT) | TREATMENT == "NA") |>
+      filter( !(SAMPLE_ID >= 1032827 & SAMPLE_ID <= 1038412))
+}
+
+ #samples <- bind_rows(sample_list)
+# samples <- samples |> filter(TREATMENT == "" | grepl("none", TREATMENT) | TREATMENT == "NA")
+# 
+# exclude_samples <- samples |> filter(SAMPLE_ID >= 1032827 & SAMPLE_ID <= 1038412)
+# exclude_samples <- exclude_samples$SAMPLE_ID
+
+```
+
+Plotting Group
+
+```{r}
+plotProteinListLungSubtype(half_1_protein_list, lung_normal_data, sample_list, lung_subtype_list, half_1_protein_name)
+
+plotProteinListLungSubtype(half_2_protein_list, lung_normal_data, sample_list, lung_subtype_list, half_2_protein_name)
+```
+
+Plotting individual
+
+```{r}
+plotProteinLungSubtype("CD109", lung_normal_data, sample_list, lung_subtype_list)
+ggsave("plots/CD109_NSCLC_protein_expression.png")
+
+plotProteinLungSubtype("CD151", lung_normal_data, sample_list, lung_subtype_list)
+ggsave("plots/CD151_NSCLC_protein_expression.png")
+
+plotProteinLungSubtype("CD166", lung_normal_data, sample_list, lung_subtype_list)
+ggsave("plots/CD166_NSCLC_protein_expression.png")
+
+plotProteinLungSubtype("EPCAM", lung_normal_data, sample_list, lung_subtype_list)
+ggsave("plots/EPCAM_NSCLC_protein_expression.png")
+
+plotProteinLungSubtype("CD276", lung_normal_data, sample_list, lung_subtype_list)
+ggsave("plots/CD276_NSCLC_protein_expression.png")
+
+
+```
+
+Removing batch effects?? Not much difference has been found in removing batch effects between different quantification/acquisition mode (MS/MS Detector)
+
+```{r}
+# temp <- pointsProteinLungSubtype("CD109", lung_normal_data, sample_list, lung_subtype_list)
+# exp_sample_lung <- temp |> left_join(lung_samp_2, join_by(SAMPLE_ID))
+# lung_sample <- bind_rows(sample_list)
+# lung_samp_2 <- bind_rows(lung_sample, lung_normal_data)
+# exp_sample_lung <- temp |> left_join(lung_samp_2, join_by(SAMPLE_ID))
+# exp_sample_lung <- exp_sample_lung |> select(!`__metadata`)
+# exp_sample_lung <- exp_sample_lung |> select(!EXPRESSION)
+# exp_samp_lung <- exp_sample_lung |> select(SAMPLE_ID:DESCRIPTION, QUANTIFICATION_METHOD:ACQUISITION_MODE)
+# design <- exp_samp_lung$condition
+# batch <- exp_samp_lung$MS_DETECTOR
+# batch2 <- exp_samp_lung$QUANTIFICATION_METHOD
+# x <- exp_samp_lung$expression
+# 
+# x <- t(x)
+# 
+# 
+# levels(design) <- 1:4
+# design <- as.matrix(as.numeric(design))
+# x_noBatch <- removeBatchEffect(x, batch = batch, batch2 = batch2, design = design)
+# 
+# toPlot <- as.data.frame(t(x_noBatch) |> cbind(design))
+# colnames(toPlot) <- c("expression", "condition") 
+# 
+# toPlot$condition <- factor(toPlot$condition)
+# levels(toPlot$condition) <- c("normal", "adeno", "SqCC", "LCC")
+# 
+# toPlot |> ggplot(aes(x = condition, y = expression, fill = condition)) + geom_boxplot()
+```
+
+# Breast Cancer Data
+
+Analyzes the breast cancer data by filtering the breast tissue data from the total tissue data and using manual searching to find normal or cancer data
+
+```{r}
+#View breast samples
+
+breast_tissue <- tissue_data |> 
+  filter(grepl("breast", NAME) | grepl("breast", SAP_SYNONYM)) |> 
+  filter(!(NAME %in% c("MCF-10A cell", "HMT-3522 cell", "breast hyperplasia cell", "HMELonza"))) #Removing problematic tissues
+
+breast_sample_data <- list()
+for(sampLink in breast_tissue$Sample$`__deferred`$uri){
+  temp <- list(getAPIData(paste0(sampLink, "?$format=json")))
+  
+  breast_sample_data <- c(breast_sample_data, temp)
+}
+
+#Removes empty elements
+breast_tissue <- breast_tissue[!sapply(breast_sample_data, is_empty), ]
+
+breast_sample_data <- Filter(length, breast_sample_data)
+
+#Removes any samples with treatments
+breast_sample_data <- lapply(breast_sample_data, 
+                             function(data) filter(data, 
+(TREATMENT == "" | TREATMENT == "NA" | grepl("none", TREATMENT))
+                                                   )
+                             )
+```
+
+```{r}
+
+
+
+#Obtaining normal breast data from potential tissues (some are empty)
+HMEpC <- breast_sample_data[[11]]
+breastData <- breast_sample_data[[2]]
+MCF10F <- getAPIData("http://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Tissue('BTO%3A0003900')/Sample?$format=json")
+HUMA7 <- getAPIData("http://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Tissue('BTO%3A0004127')/Sample?$format=json")
+HUMAN7 <- getAPIData("http://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Tissue('BTO%3A0004865')/Sample?$format=json")  
+
+
+#Gets the data frame of sample data for normal and cancer
+breastNorm <- breastData |> filter(DISEASE_ID == "")
+
+breast_normal_data <- bind_rows(HMEpC, breastNorm, MCF10F, HUMA7, HUMAN7)
+
+breastCancer <- breastData |> filter(DISEASE_ID != "")
+
+breast_cancer_data <- breastCancer
+
+for(index in 1:length(breast_sample_data)){
+  breast_sample_data[[index]]$ELECTROPHORESIS <- as.character(breast_sample_data[[index]]$ELECTROPHORESIS)
+}
+
+breast_cancer_data <- bind_rows(breast_cancer_data, breast_sample_data[c(-2, -11)])
+
+#plotDataB <- pointsProteinList(protein_list, breast_normal_data, breast_cancer_data)
+
+#plotProteinList(protein_list, breast_normal_data, breast_cancer_data)
+
+#plotProteinListIso(protein_list, breast_normal_data, breast_cancer_data)
+
+plotProteinList(half_1_protein_list, breast_normal_data, breast_cancer_data, half_1_protein_name)
+plotProteinList(half_2_protein_list, breast_normal_data, breast_cancer_data, half_1_protein_name)
+
+#plotProteinListIso(half_1_protein_list, breast_normal_data, breast_cancer_data)
+#plotProteinListIso(half_2_protein_list, breast_normal_data, breast_cancer_data)
+```
+
+## Subtype Analysis
+
+Breast cancer data is in the project "Tyanova_ncomms_2016", with the subtype information available in the paper. Normal data can be taken from the previous data
+
+```{r}
+
+#Uses the project id of the project to get the experiment data (id = 4473)
+project_data_BC <- getAPIData("https://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Project?$format=json&$filter=PUBMEDID eq '26725330'")
+
+#Gets experiment data (experiment id = 13219)
+experiment_data_BC <- getAPIData("https://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Project(4473)/Experiment?$format=json")
+
+#Gets sample data  for the project
+sample_data_BC <- getAPIData("https://www.proteomicsdb.org/proteomicsdb/logic/api_v2/api.xsodata/Experiment(13219)/Sample?$format=json")
+
+#Gets subtype data for the project samples
+subtype_BC_data <- read_delim("data/BC_Proteomics_Subtype.txt", delim = " ")
+
+sample_subtype_BC <- sample_data_BC |> select(NAME, ProteinExpression)
+
+#Gets numeric value of sample
+sample_subtype_BC$sample_num <- sapply(sample_subtype_BC$NAME, function(data) substr(data, start = 3, stop = 4)) |> str_replace("_", "") |> as.numeric()
+
+#Gets numeric value of sample to compare to subtype
+subtype_BC_data <- subtype_BC_data[-27, ]
+subtype_BC_data$`Sample_#` <- as.numeric(subtype_BC_data$`Sample_#`)
+
+#Adds the subtype for each sample
+sample_subtype_BC$subtype <- sapply(sample_subtype_BC$sample_num, 
+                 function(data) subtype_BC_data$Clinical_classification[which(data == subtype_BC_data$`Sample_#`)])
+
+
+
+plotProteinListSubtype(half_1_protein_list, breast_normal_data, sample_subtype_BC, half_1_protein_name)
+plotProteinListSubtype(half_2_protein_list, breast_normal_data, sample_subtype_BC, half_2_protein_name)
+
+#plotProteinListIsoSubtype(half_1_protein_list, breast_normal_data, sample_subtype_BC)
+#plotProteinListIsoSubtype(half_2_protein_list, breast_normal_data, sample_subtype_BC)
+```
+
+```{r}
+#| warning: false
+
+plotProteinSubtype("CD9", breast_normal_data, sample_subtype_BC)
+ggsave("plots/CD9_BC_protein_expression.png")
+
+plotProteinSubtype("CD151", breast_normal_data, sample_subtype_BC)
+ggsave("plots/CD151_BC_protein_expression.png")
+
+plotProteinSubtype("CD166", breast_normal_data, sample_subtype_BC)
+ggsave("plots/CD166_BC_protein_expression.png")
+
+plotProteinSubtype("EPCAM", breast_normal_data, sample_subtype_BC)
+ggsave("plots/EPCAM_BC_protein_expression.png")
+
+plotProteinSubtype("CD276", breast_normal_data, sample_subtype_BC)
+ggsave("plots/CD276_BC_protein_expression.png")
+
+
+```
+
+```{r}
+plotProteinListLung(NSCLC_protein_list, lung_normal_data, lung_cancer_data, NSCLC_protein_name)
+
+plotProteinListLungSubtype(NSCLC_protein_list, lung_normal_data, sample_list, lung_subtype_list, NSCLC_protein_name)
+
+plotProteinList(BC_protein_list, breast_normal_data, breast_cancer_data, BC_protein_name)
+
+plotProteinListSubtype(BC_protein_list, breast_normal_data, sample_subtype_BC, BC_protein_name)
+```

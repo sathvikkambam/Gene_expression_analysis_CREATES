@@ -1,0 +1,1713 @@
+---
+title: "mRNA_BC"
+format: html
+editor: visual
+---
+
+# Data Preparation
+
+## TCGA Data
+
+LOAD LIBRARIES FIRST
+
+ALSO DONT USE THIS IF ALREADY HAVE THE FILES
+
+First, the meta data is downloaded from TCGA and is downloaded using jsonlite::fromJSON("filepath"). Then, the columns can be filtered to only the filename and the associated entities. Then, since the associated entities is a list of dataframes for each file, combine them with bind_rows and put the entity_submitter_id column into the associated entities column
+
+```{r}
+# library(jsonlite)
+# #Load the metadata
+# filePath = "data/Normal_Breast/TCGA_BRCA/metadata.repository.2025-06-16.json"
+# 
+# temp <- fromJSON(filePath)
+# 
+# #Select columns of interest
+# temp <- temp |> select(associated_entities, file_name)
+# 
+# #Extract barcode from associated entities
+# temp$associated_entities <- bind_rows( #Combines all data frames in the list
+#                                       temp$associated_entities
+#                             )$entity_submitter_id
+# 
+# #Gets the plate value, which is the 6th part of the barcode
+# temp <- temp |> mutate(
+#   plate = sapply(
+#     temp$associated_entities,
+#     function(data) str_split_i(data, "-", 6)
+#   )
+# )
+# 
+# #Remove the barcode column and save the file for easier loading
+# temp2 <- temp |> select(!associated_entities)
+# write_rds(temp2, "data/Normal_Breast/TCGA_BRCA/metadata_BRCA_normal.rds")
+```
+
+To load in the data and process it, the file list is needed from the metadata. This is done instead of using list.files(... "\*.tsv") since the order of file reads is known, so each sample can be labeled.
+
+```{r}
+# #Reads all the tsv files in a specific order and joins them vertically
+# #temp2 was metadata from before
+# tempFiles <- sapply(#sapply applies the function over the list
+#   temp2$file_name,
+#   function(data) paste0("data/Normal_Breast/TCGA_BRCA/", data) #Custom function bc can onyl have one input
+# )
+# 
+# #Use already known col names from TCGA tsv files
+# col_name = c("gene_id","gene_name","gene_type","unstranded","stranded_first","stranded_second","tpm_unstranded","fpkm_unstranded","fpkm_uq_unstranded")
+# 
+# #Reads in data.. Skips the first 6 lines bc of non-data
+# tempData <- read_tsv(tempFiles, col_names = col_name, skip = 6)
+# 
+# #Remove unnecessry columns (Can save tpm data if not using DESeq2)
+# tempData <- tempData |> select(gene_id, gene_name, unstranded)
+# 
+# #Labels each sample using column of sample name
+# tempSample <- sapply(
+#   temp2$file_name,
+#   function(data) str_split_i(data, "\\.", 1)
+# )
+# 
+# #Labels each sample via a number and puts in the file name
+# tempData <- tempData |> mutate(
+#   sample = (row_number()-1) %/% 60660 + 1
+# )
+# 
+# tempData$sample <- tempSample[tempData$sample]
+```
+
+Now, the data is going to be turned into a matrix, with unnecessary gene id data being removed
+
+```{r}
+# #Turns the data into a matrix
+# tempMatrix <- tempData |> pivot_wider(names_from = sample, values_from = unstranded)
+# 
+# 
+# #Removes the values after the dots from the gene_ids while keeping the _PAR_Y data
+# #Splits the gene_id along the periods 
+# temp <- sapply(tempMatrix$gene_id, function(data) str_split_1(data, "\\.")) 
+# 
+# #Finds the values whose values after the period are longer than 2, since those have _PAR_Y after 
+# temp2 <- sapply(temp[2, ], str_length) > 2  
+# 
+# #Changes the first column to include the _PAR_Y for those values 
+# temp[1, temp2] <- sapply(temp[1, temp2], function(data) paste0(data, "_PAR_Y"))  
+# 
+# #Puts it into the cancer data 
+# tempMatrix$gene_id <- temp[1, ]
+# 
+# #Saves the data in an R RDS file for easier loading
+# write_rds(tempMatrix, "data/Normal_Breast/TCGA_BRCA/normal_breast_BRCA.rds")
+```
+
+# Loading Libraries
+
+```{r}
+#| include: false
+
+library(jsonlite)
+library(tidyverse)
+library(ggplot2)
+library(DESeq2)
+library("Biobase")
+library("gplots")
+library("ggplot2")
+library("RColorBrewer")
+library("pheatmap")
+library("matrixStats")
+library("lattice")
+library("gtools")
+library("dplyr")
+library(edgeR)
+library(ggsignif)
+library("BiocParallel")
+library("ggpubr")
+
+
+```
+
+# Functions
+
+## Single Genes
+
+The functions for creating the graph and the points to graph are obtained from the DESeq2 website
+
+### Plotting
+
+```{r}
+geneBoxPlot <- function(geneName, ddsData, resData) {
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  cPlot <- plotCounts(ddsData, 
+                    gene=geneId, 
+                    intgroup="condition", 
+                    returnData = TRUE
+                    )
+  #Gets the adjusted p values for the gene
+  pGene <- resData[geneId, ]$padj
+
+    graph <- cPlot |> ggplot(aes(x=condition, y=count, fill=condition))+
+    geom_boxplot(outliers = FALSE) + 
+#  geom_point(position=position_jitter(w=0.1,h=0), alpha = 0.2) +
+  labs(
+    title=paste("mRNA Counts for",geneName),
+    subtitle=paste("Gene ID:", geneId),
+    caption=paste("p-value =", pGene)
+  )
+  
+  return(graph)
+}
+```
+
+### Points
+
+```{r}
+genePlotPoints <- function(geneName, ddsData, resData) {
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  cPlot <- plotCounts(ddsData, 
+                    gene=geneId, 
+                    intgroup="condition", 
+                    returnData = TRUE
+                    )
+  return(cPlot)
+}
+```
+
+## Multiple Genes
+
+```{r}
+plotGeneList <- function(geneList, geneName, ddsData, resData, transformFunc = NA){
+  
+  pointsPlot <- data.frame()
+  
+  for(index in 1:length(geneList)){
+    pointsPlot <- pointsPlot |> bind_rows(
+      genePlotPoints(geneList[index], ddsData, resData) |> mutate(gene=geneName[index]))
+  }
+  
+  pointsPlot$gene <- factor(pointsPlot$gene, levels = geneName)
+  
+  #Checks if a transform should be applied
+  if(!is.na(transformFunc)){
+    pointsPlot$trans_count <- transformFunc(pointsPlot$count)
+  }
+  else{
+    pointsPlot$trans_count <- pointsPlot$count
+  }
+  
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- pointsPlot |> select(trans_count, gene, condition) |> group_by(gene, condition) |> reframe(
+    five = fivenum(trans_count)[4], IQR = IQR(trans_count), max = max(trans_count)
+  )
+
+  summary <- summary |> mutate(maxLim = five + 1.5*IQR)
+  
+  maxLim <- max(summary$maxLim)
+  maxValue = max(summary$max)
+  
+  maxLim <- min(maxLim, maxValue)
+  
+  #Scales the parameters of the statistical labeling since positions will at outliers and not whisker end
+  margin_top <- maxLim*0.02/maxValue
+  y_pos <- maxLim + margin_top
+  
+  pointsPlot |> ggplot(aes(x=gene, y=trans_count, fill=condition))+
+      geom_boxplot(outliers = F) + 
+      ggpubr::stat_compare_means(test = 'wilcox.test', label = 'p.signif', show.legend = F, label.y= y_pos) +
+    labs(
+      title="Gene Expression in Breast Cancer",
+      x = "Gene Name",
+      y="Gene Expression"
+    ) +
+    theme_classic()
+  
+  
+}
+```
+
+## Receptor Plot
+
+This is the function for plotting the data for plotting the expressions of the ER, PR, and HER2 receptors along the breast cancer samples, but can be used for any gene
+
+```{r}
+plotSubTypes <- function(geneName, ddsData, resData, sampleTypes, subtypeName){
+  data <- genePlotPoints(geneName, ddsData, resData)
+
+  #sub type data to use
+  #sampleTypes should have two columns, sample and the category of choice
+  subData <- sampleTypes
+  colnames(subData) <- c("sample", "subtype")
+  
+  #Puts the row names in a column to use as a key for a full join
+  plotData <- rownames_to_column(data)
+  plotData <- plotData |> full_join(subData, join_by(rowname == sample))
+  
+  plotData <- plotData |> mutate(
+    subtype = if_else(condition == "normal", condition, subtype)
+  )
+  
+  #Turns the oclumn into a factor with the normal subtype being first
+  plotData$subtype <- factor(plotData$subtype)
+  plotData$subtype <- relevel(plotData$subtype, ref = "normal")
+
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- plotData |> select(count, subtype) |> group_by(subtype) |> reframe(
+    five = fivenum(count)[4], IQR = IQR(count)
+  )
+
+  maxQ3 <- max(summary$five)
+  temp <- (maxQ3 == summary$five)
+  temp <- summary[temp, ]
+  maxLim <- temp$five + 1.5*temp$IQR
+  
+  #Plots the data  
+  plotData |> ggplot(aes(x=subtype, y=count, color=subtype)) + 
+    geom_boxplot() + 
+    coord_cartesian(ylim = c(0, maxLim)) +
+    geom_point(position=position_jitter(w=0.1,h=0), alpha = 0.2) +
+    labs(
+      title=paste0(subtypeName, " expression vs ", subtypeName, " +/- samples"),
+      color = subtypeName
+    )
+}
+```
+
+## PAM50 Subtypes
+
+Plots the breast cancer subtypes from samples from the publication. Doesn't include all samples
+
+<https://www.nature.com/articles/nature11412>
+
+### Points
+
+```{r}
+plotPAM50Points <- function(geneName, ddsData, resData, subtype_sample){
+  #CD276 with cancer subtype
+  #Points to plot
+  data <- genePlotPoints(geneName, ddsData, resData)
+  
+  #sub type data to use
+  subData <- subtype_sample |> select(sample, PAM50)
+  
+  #Puts the row names in a column to use as a key for a full join
+  plotData <- rownames_to_column(data)
+  plotData <- plotData |> full_join(subData, join_by(rowname == sample))
+  
+  #Fills the PAM50 column with normal for normal cells
+  plotData <- plotData |> mutate(
+    PAM50 = if_else(condition == "normal", condition, PAM50)
+  )
+  
+  #plotData$PAM50 <- factor(plotData$PAM50, levels = c("normal", "Normal-like", "Luminal A", "Luminal B", "HER2-enriched", "Basal-like", "NA"))
+  
+  #Combine Luminal A/B samples
+  plotData$PAM50[plotData$PAM50 == "Luminal A" | plotData$PAM50 == "Luminal B"] <- "ER/PR+"
+  
+  #REname basal-like samples to TNBC
+  plotData$PAM50[plotData$PAM50 == "Basal-like"] <- "TNBC"
+  
+
+  #REmove NA samples
+  plotData <- plotData |> filter((PAM50 %in% c("normal", "ER/PR+", "HER2-enriched", "TNBC")))
+
+  #Puts the subtypes in order
+  plotData$PAM50 <- factor(plotData$PAM50, levels = c("normal", "ER/PR+", "HER2-enriched", "TNBC"))
+  
+  return(plotData)
+}
+```
+
+### Plotting
+
+```{r}
+plotPAM50 <- function(geneName, ddsData, resData, subtype_sample){
+  #CD276 with cancer subtype
+  #Points to plot
+  data <- genePlotPoints(geneName, ddsData, resData)
+  
+  #sub type data to use
+  subData <- subtype_sample |> select(sample, PAM50)
+  
+  #Puts the row names in a column to use as a key for a full join
+  plotData <- rownames_to_column(data)
+  plotData <- plotData |> full_join(subData, join_by(rowname == sample))
+  
+  #Fills the PAM50 column with normal for normal cells
+  plotData <- plotData |> mutate(
+    PAM50 = if_else(condition == "normal", condition, PAM50)
+  )
+  
+  #plotData$PAM50 <- factor(plotData$PAM50, levels = c("normal", "Normal-like", "Luminal A", "Luminal B", "HER2-enriched", "Basal-like", "NA"))
+  
+  #Combine Luminal A/B samples
+  plotData$PAM50[plotData$PAM50 == "Luminal A" | plotData$PAM50 == "Luminal B"] <- "ER/PR+"
+  
+  #REname basal-like samples to TNBC
+  plotData$PAM50[plotData$PAM50 == "Basal-like"] <- "TNBC"
+  
+
+  #REmove NA samples
+  plotData <- plotData |> filter((PAM50 %in% c("normal", "ER/PR+", "HER2-enriched", "TNBC")))
+
+  #Puts the subtypes in order
+  plotData$PAM50 <- factor(plotData$PAM50, levels = c("normal", "ER/PR+", "HER2-enriched", "TNBC"))
+  
+  plotData |> ggplot(aes(x=PAM50, y=count, fill=PAM50)) +
+    geom_boxplot(outliers = FALSE) + 
+    scale_x_discrete(guide = guide_axis(n.dodge = 2)) +
+    labs(
+      title=paste(geneName, "expression of BC subtypes")
+    )
+}
+```
+
+## Gene List PAM50
+
+Plots multiple genes using the publication subtypes
+
+```{r}
+plotGeneListPAM50Subtypes <- function(geneList, geneName, ddsData, resData, subtype_sample, transformFunc = NA){
+  
+  pointsPlot <- data.frame()
+  
+  for(index in 1:length(geneList)){
+    pointsPlot <- pointsPlot |> bind_rows(
+      plotPAM50Points(geneList[index], ddsData, resData, subtype_sample) |> mutate(gene=geneName[index]))
+  }
+  
+  pointsPlot$gene <- factor(pointsPlot$gene, levels = geneName)
+  
+  #Checks if a transform should be applied
+  if(!is.na(transformFunc)){
+    pointsPlot$trans_count <- transformFunc(pointsPlot$count)
+  }
+  else{
+    pointsPlot$trans_count <- pointsPlot$count
+  }
+  
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- pointsPlot |> select(trans_count, gene, PAM50) |> group_by(gene, PAM50) |> reframe(
+    five = fivenum(trans_count)[4], IQR = IQR(trans_count), max = max(trans_count)
+  )
+
+  summary <- summary |> mutate(maxLim = five + 1.5*IQR)
+  
+  maxLim <- max(summary$maxLim)
+  maxValue = max(summary$max)
+  
+  maxLim <- min(maxLim, maxValue)
+  
+  #Scales the parameters of the statistical labeling since positions will at outliers and not whisker end
+  margin_top <- maxLim*0.02/maxValue
+  y_pos <- maxLim + margin_top
+  
+  pointsPlot |> ggplot(aes(x=gene, y=trans_count, fill=PAM50))+
+      geom_boxplot(outliers = F) + 
+      ggpubr::stat_compare_means(test = 'wilcox.test', label = 'p.signif', show.legend = F, label.y= y_pos) +
+    labs(
+      title="Gene Expression in Breast Cancer Subtypes",
+      subtitle = "Subtypes from publication",
+      x = "Gene Name",
+      y="Gene Expression"
+    ) +
+    theme_classic()
+  
+  
+}
+```
+
+## PAM50 + Manual Subtypes
+
+This is the function to plot the different subtypes of cancer for different genes after sorting all breast cancer samples into a subtype using the ER, PR, and HER2 receptor expressions and storing the subtype data in a seperate data frame
+
+### Points
+
+```{r}
+plotSubPoints <- function(geneName, ddsData, resList, subData){
+  #Points to plot
+  data <- genePlotPoints(geneName, ddsData, resList[[1]])
+  
+  #sub type data to use
+  #subData <- rownames_to_column(fullSubType) |> select(rowname, PAM50)
+  subData$PAM50 <- factor(subData$PAM50, levels = c("normal", "Normal-like", "ER/PR+", "HER2-enriched", "TNBC"))
+  
+  #Puts the row names in a column to use as a key for a full join
+  plotData <- rownames_to_column(data)
+  plotData <- plotData |> full_join(subData, join_by(rowname == rowname)) |> filter(PAM50 != "Normal-like")
+  
+  return(plotData)
+}
+```
+
+### Plotting
+
+```{r}
+plotCancerTypes <- function(geneName, ddsData, resList, subData, name = ""){
+  #CD151 with cancer subtype
+  #Points to plot
+  plotData <- plotSubPoints(geneName, ddsData, resList, subData)
+  
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- plotData |> select(count, PAM50) |> group_by(PAM50) |> reframe(
+    five = fivenum(count)[4], IQR = IQR(count), max = max(count)
+  )
+
+  maxQ3 <- max(summary$five)
+  temp <- (maxQ3 == summary$five)
+  temp <- summary[temp, ]
+  maxLim <- temp$five + 1.5*temp$IQR
+  maxValue = max(summary$max)
+
+  plotData$condition <- factor(unfactor(plotData$PAM50), levels = c("normal", "ER/PR+", "HER2-enriched", "TNBC"))
+  levels(plotData$condition) <- c("normal", "ERPR", "HER2", "TNBC")
+  
+   comps = list(
+     c("normal", "ERPR"),
+     c("normal", "HER2"),
+     c("normal", "TNBC")
+ )
+  
+   if(name != ""){
+     geneName <- name
+   }
+   
+  plotData |> ggplot(aes(x=condition, y=count, fill=condition)) + 
+    geom_boxplot(outliers = FALSE) + 
+    #coord_cartesian(ylim = c(0, maxLim * 1.30)) + 
+    geom_signif(comparisons = comps, map_signif_level = TRUE, tip_length = maxLim*0.03/maxValue, y_position = c(maxLim, maxLim*1.08, maxLim*1.16), margin_top = 0) +
+    labs(
+      title=paste0(geneName, " Gene Expression in Breast Cancer Subtypes"),
+      y = "gene expression",
+    )
+
+}
+```
+
+## Gene List Subtypes
+
+Plots multiple genes suing sorted samples into each subtypes
+
+```{r}
+plotGeneListSubtypes <- function(geneList, geneName, ddsData, resList, subData, transformFunc = NA){
+  
+  pointsPlot <- data.frame()
+  
+  for(index in 1:length(geneList)){
+    pointsPlot <- pointsPlot |> bind_rows(
+      plotSubPoints(geneList[index], ddsData, resList, subData) |> mutate(gene=geneName[index]))
+  }
+  
+  pointsPlot$gene <- factor(pointsPlot$gene, levels = geneName)
+  
+  pointsPlot <- pointsPlot |> filter(PAM50 != "Normal-like")
+
+  pointsPlot$PAM50 <- factor(unfactor(pointsPlot$PAM50), levels = c("normal", "ER/PR+", "HER2-enriched", "TNBC"))
+  levels(pointsPlot$PAM50) <- c("normal", "ERPR", "HER2", "TNBC")
+  
+  condLevels <- levels(pointsPlot$PAM50)
+  
+  pointsPlot$interaction <- factor(interaction(pointsPlot$gene, pointsPlot$PAM50),
+                           levels = c(t(sapply(condLevels, function(d) paste(geneName, d, sep=".")))))
+  
+  labels <- c()
+  for(gene in geneName){
+    labels <- c(labels, " ", gene, " ", " ")
+  }
+  
+  
+  temp <- as.data.frame(sapply(condLevels, function (d) paste(geneName, d, sep=".")))
+  comps <- list()
+  for(i in 1:length(geneName)){
+    temp1 <- list(c(temp[i, "normal"], temp[i, "ERPR"]), c(temp[i, "normal"], temp[i, "HER2"]), c(temp[i, "normal"], temp[i, "TNBC"]))
+    comps <- c(comps, temp1)
+  }
+  
+  #Checks if a transform should be applied
+  if(!is.na(transformFunc)){
+    pointsPlot$trans_count <- transformFunc(pointsPlot$count)
+  }
+  else{
+    pointsPlot$trans_count <- pointsPlot$count
+  }
+  
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- pointsPlot |> select(trans_count, gene, PAM50) |> group_by(gene, PAM50) |> reframe(
+    five = fivenum(trans_count)[4], IQR = IQR(trans_count), max = max(trans_count)
+  )
+
+  summary <- summary |> mutate(maxLim = five + 1.5*IQR)
+  
+  maxLim <- max(summary$maxLim)
+  maxValue = max(summary$max)
+  
+  maxLim <- min(maxLim, maxValue)
+  
+  #Scales the parameters of the statistical labeling since positions will at outliers and not whisker end
+  margin_top <- maxLim*0.02/maxValue
+  y_pos <- c(rep(maxLim + 0.08*maxLim*(0:(length(levels(pointsPlot$PAM50)) - 2)), length(geneList)))
+  tip_length <- maxLim*0.02/maxValue
+
+  
+  pointsPlot |> ggplot(aes(x=interaction, y=trans_count, fill=PAM50)) +
+    geom_boxplot(outliers = F) + 
+    labs(
+      title="Gene Expression in Breast Cancer Subtypes",
+      x = "Gene Name",
+      y="Gene Expression"
+    ) +
+    geom_signif(
+      comparisons = comps,
+      map_signif_level = T,
+      y_position = y_pos,
+      tip_length = tip_length,
+    ) + 
+    scale_x_discrete(
+      labels = labels
+    ) +
+    theme_classic()
+  
+  
+}
+```
+
+# Loading Data
+
+## Normal Data
+
+Now, the normal data is loaded using files from GTex. The files have already been processed to keep/remove information, which is now in R's object files.
+
+```{r}
+#GTex data
+# #Loads the RNA data for normal breast data
+# normal_breast <- read_rds("data/Normal_Breast/normal_breast.rds")
+# 
+# #Loads metadata such as batch data for these samples
+# metaDataNormal <- read_rds("data/Normal_Breast/meta_data.rds")
+
+#TCGA BRCA data
+normal_breast <- read_rds("data/Normal_Breast/TCGA_BRCA/normal_breast_BRCA.rds")
+
+#Loads metadata such as batch data for these samples
+metaDataNormal <- read_rds("data/Normal_Breast/TCGA_BRCA/metadata_BRCA_normal.rds")
+```
+
+Makes sure the gene_id has the numbers after the period removed, since that is the version number and is different between Gtex and TCGA.
+
+```{r}
+#Comment out if not using GTex data
+# #Removes the period and the values after from the Name column
+# temp <- sapply(normal_breast$Name, function(data) str_split_1(data, "\\."))
+# 
+# #Finds the values whose values after the period are longer than 2, since those have _PAR_Y after 
+# temp2 <- sapply(temp[2, ], str_length) > 2  
+# 
+# #Changes the first column to include the _PAR_Y for those values 
+# temp[1, temp2] <- sapply(temp[1, temp2], function(data) paste0(data, "_PAR_Y"))  
+# 
+# #RE-inserts it into the data
+# normal_breast$Name <- temp[1, ]
+```
+
+## Cancer Data
+
+Then, the cancer data is loaded using TCGA data and processed metadata and the tsv files.
+
+```{r}
+#Loads the metadata
+metaDataBRCA = read_rds("data/Cancer_Breast/metadata_BRCA_cancer.rds")
+
+#Load mRNA sequencing data
+cancer_breast <- read_rds("data/Cancer_Breast/cancer_breast_BRCA.rds")
+
+
+```
+
+# Prep Data for DESeq2
+
+The matrices are combined horizontally by genes using joins. A full join is used to preserve gene data from both types, since not all the genes analyzed were the same.
+
+```{r}
+#Now the gene ids are set to become the row names
+#For turning gene id into gene name
+
+#GTEX
+#norm_gene_key <- normal_breast |> select(Name, Description)
+#normal_breast <- normal_breast |> select(!c(Description))
+#TCGA
+norm_gene_key <- normal_breast |> select(gene_id, gene_name)
+normal_breast <- normal_breast |> select(!c(gene_name))
+
+#Now for cancer samples
+cancer_gene_key <- cancer_breast |> select(gene_id, gene_name)
+cancer_breast <- cancer_breast |> select(!c(gene_name))
+
+#Name and gene_id are kept to be used as the key for joining them together
+#Combines gene id for the combined matrix
+combined_breast <- normal_breast |> full_join(cancer_breast, join_by(gene_id == gene_id))
+
+#Forms the matrix while movign the Name column into the row names
+combined_breast_matrix <- as.matrix(
+  column_to_rownames(combined_breast, var = "gene_id") #would be "Name" if GTex
+)
+
+#Turns NA values to 0
+combined_breast_matrix[is.na(combined_breast_matrix)] <- 0
+```
+
+Now the column data is needed for the variables such as condition (normal vs cancer) and what batch they were in.
+
+```{r}
+#Creates matrix for metadata
+coldata = matrix(0, nrow = dim(combined_breast_matrix)[2], ncol = 2)
+
+#Renames columns and rows
+rownames(coldata) = colnames(combined_breast_matrix)
+colnames(coldata) = c("condition", "batch")
+
+#sets values for condition and batch using metadata
+#There is a -1 since the Name column hasn't been removed
+coldata[1:(dim(normal_breast)[2] - 1), "condition"] = "normal"
+coldata[(dim(normal_breast)[2]):dim(coldata)[1], "condition"] = "cancer"
+
+#GTEX
+#coldata[1:(dim(normal_breast)[2] - 1), "batch"] = metaDataNormal$batch
+coldata[1:(dim(normal_breast)[2] - 1), "batch"] = metaDataNormal$plate
+coldata[(dim(normal_breast)[2]):dim(coldata)[1], "batch"] = metaDataBRCA$plate
+
+#Converts col data into a data frame for the DESeq2 method and factorizes it
+coldata <- as.data.frame(coldata)
+coldata$condition <- factor(coldata$condition)
+coldata$batch <- factor(coldata$batch)
+
+```
+
+# DESeq2 Analysis
+
+Now the DESeq2 analysis is run using the created combined_breast_matrix and the coldata data frame. This also uses parallel cores.
+
+However, this currently doesn't work since the batches on the cancer side are entirely separate from the batches on the normal side. So, currently only condition is tested.
+
+With TCGA cancer data, there is batch data, but the DESeq function takes too long.
+
+```{r}
+#Parallel Cores for faster running
+#Need to set parallel = TRUE
+register(SnowParam(4, exportglobals = FALSE))
+
+#Uses DESeq2 method to analyze the matrix data
+dds <- DESeqDataSetFromMatrix(countData = combined_breast_matrix,
+                              colData = coldata,
+                              #design = ~ batch + condition)
+                              design = ~ condition)
+
+#Sets normal patients as the control
+dds$condition <- relevel(dds$condition, ref = "normal")
+
+#Prefilters to speed up method
+temp <- coldata |> group_by(condition) |> summarize(n=n())
+
+smallestGroupSize <- min(temp$n)
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+#Runs all the analysis
+#Uses glm engine since it is faster, but requires likelyhood ratio test (LRT), which requires a reduced design.
+  #If only condition is used, then reduced = ~1. If batch + condition is used, then reduced = ~batch
+#dds <- DESeq(dds, parallel = TRUE, fitType = "glmGamPoi", test="LRT", reduced = ~1)
+
+#Runs withoutglm
+dds <- DESeq(dds, parallel = TRUE)
+
+res <- results(dds)
+```
+
+Now that the DESeq2 function has finished running, the gene log fold change data can be shown.
+
+```{r}
+resLFC <- lfcShrink(dds, coef="condition_cancer_vs_normal", type="apeglm", parallel = TRUE)
+plotMA(resLFC, ylim=c(-10,10))
+```
+
+## Graphing Normal vs Breast Cancer Genes
+
+Now, the box plots of the genes of interest.
+
+The graphs of the CD151 and EPCAM genes are shown below
+
+```{r}
+
+#CD97
+geneBoxPlot("ADGRE5", dds, res)
+
+#CD109
+geneBoxPlot("CD109", dds, res)
+
+#CD151
+geneBoxPlot("CD151", dds, res)
+
+#CD166
+geneBoxPlot("ALCAM", dds, res)
+
+#EPCAM
+geneBoxPlot("EPCAM", dds, res)
+
+
+```
+
+Combining them
+
+```{r}
+
+geneList <- c("CD9", "ADGRE5", "CD109","MCAM", "CD151", "ALCAM", "CD276", "EPCAM", "FGFR4")
+geneName <- c("CD9", "CD97", "CD109","CD146", "CD151", "CD166", "CD276", "EPCAM", "FGFR4")
+
+
+plotGeneList(geneList[1:4], geneName[1:4], dds, res)
+plotGeneList(geneList[5:9], geneName[5:9], dds, res)
+
+plotGeneList(geneList[1:4], geneName[1:4], dds, res, log10)
+plotGeneList(geneList[5:9], geneName[5:9], dds, res, log10)
+plotGeneList(geneList[c(1, 5, 7, 8)], geneName[c(1, 5, 7, 8)], dds, res, log10)
+
+```
+
+## Classifying the breast cancers
+
+The cancer samples can then be classified as ER+/PR+, HER2+, and TNBC.
+
+-   ER+ cancers over express estrogen receptors, encoded by the gene ESR1.
+
+-   PR+ cancers mostly express ER+ as well and are encoded by the gene PSR.
+
+-   HER2+ cancers can either express ER+, PR+ or be negative for both. HER2 is encoded by ERBB2.
+
+-   TNBC cancers test negative for all three proteins.
+
+First, the mRNA expression of these genes in normal vs cancer cells is going to be analyzed. Ki-67 is another marker for different subtypes of breast cancer: luminal A and luminal B.
+
+```{r}
+#ER - ESR1
+geneBoxPlot("ESR1", dds, res) + # + coord_cartesian(ylim = c(0, 10000))
+  geom_signif(comparisons = c("normal", "cancer"), map_signif_level=TRUE)
+
+#PR - PGR
+geneBoxPlot("PGR", dds, res)#  + coord_cartesian(ylim = c(0, 10000))
+
+#HER2 - ERBB2
+geneBoxPlot("ERBB2", dds, res)# + coord_cartesian(ylim = c(0, 10000))
+
+#KI-67 - MKI67
+geneBoxPlot("MKI67", dds, res)
+```
+
+To classify the cancer cells into the 3-4 categories, the samples need to be sorted based on their expression of the genes
+
+### Online Available Data
+
+There is data online about BRCA data that labels them based on if they are ER+/-, PR+/-, HER2+/-, and their subtype.
+
+Data obtained from "Comprehensive molecular portraits of human breast tumours \| Nature" in Supplementary Table 1
+
+The relevant data was manually extracted into another file. The data of interest are the case id, the ER, PR, HER levels, and the sub type classified from the PAM50 assay.
+
+```{r}
+subtype_data <- read_csv("data/Cancer_Breast/BC_subtype_TCGA_BRCA.csv")
+
+#Uses the metadata to match all the case ids to the sampel names
+tempMeta <- fromJSON("data/Cancer_Breast/metadata.repository.BRCA.cancer.json")
+
+#Select columns of interest
+tempMeta <- tempMeta |> select(associated_entities, file_name)
+
+#Extract barcode from associated entities
+tempMeta$associated_entities <- bind_rows( 
+                                      tempMeta$associated_entities
+                            )$entity_submitter_id
+
+#Gets the case values from the barcode
+temp <- sapply(
+    tempMeta$associated_entities,
+    function(data) str_split_1(data, "-")[1:3]
+  )
+
+temp <- as.data.frame(t(temp)) |> mutate(
+  case = paste(V1, V2, V3, sep = "-")
+)
+
+tempMeta$case <- temp$case 
+tempMeta <- tempMeta |> select(!associated_entities)
+
+#Removes file ends from the sample names
+tempMeta$sample <- sapply(
+  tempMeta$file_name,
+  function(data) str_split_i(data, "\\.", 1)
+)
+
+tempMeta <- tempMeta |> select(sample, case)
+
+#Join the metadata and the subtype data together while removing the samples that don't have a subtype
+subtype_sample <- inner_join(subtype_data, tempMeta, join_by(`Case ID` == case))
+
+#The missing values in the ER, PR, and HER2 columns are replaced with NA values
+subtype_sample$ER[!(subtype_sample$ER %in% c("Negative", "Positive"))] <- NA
+subtype_sample$PR[!(subtype_sample$PR %in% c("Negative", "Positive"))] <- NA
+subtype_sample$HER[!(subtype_sample$HER %in% c("Negative", "Positive"))] <- NA
+```
+
+The appropriate columns of the sub type data can be combined with the plotting data from DESeq2 to evaluate the effects of different subtypes of gene expression
+
+#### Plotting receptor status
+
+plots
+
+```{r}
+
+plotSubTypes("ESR1", dds, res, subtype_sample |> select(sample, ER), "ER")
+
+plotSubTypes("PGR", dds, res, subtype_sample |> select(sample, ER), "PR")
+
+plotSubTypes("ERBB2", dds, res, subtype_sample |> select(sample, ER), "HER2")
+
+
+
+
+```
+
+#### Using PAM50 data
+
+The PAM50 data is an assay that determines BC sub type using 50 markers. This sub type data can be used for checking gene expression in CD151 and EPCAM.
+
+Publication for PAM50 data: "Comprehensive molecular portraits of human breast tumours \| Nature"
+
+<https://www.nature.com/articles/nature11412>
+
+```{r}
+#CD97
+plotPAM50("ADGRE5", dds, res, subtype_sample)
+
+#CD109
+plotPAM50("CD109", dds, res, subtype_sample)
+
+#CD151
+plotPAM50("CD151", dds, res, subtype_sample)
+
+#CD166
+plotPAM50("ALCAM", dds, res, subtype_sample)
+
+#CD276 with cancer subtype
+plotPAM50("CD276", dds, res, subtype_sample)
+
+#EPCAM with cancer subtype
+plotPAM50("EPCAM", dds, res, subtype_sample)
+
+```
+
+Combinind
+
+```{r}
+
+
+plotGeneListPAM50Subtypes(geneList[1:4], geneName[1:4], dds, res, subtype_sample)
+plotGeneListPAM50Subtypes(geneList[5:9], geneName[5:9], dds, res, subtype_sample)
+
+plotGeneListPAM50Subtypes(geneList[1:4], geneName[1:4], dds, res, subtype_sample, log10)
+plotGeneListPAM50Subtypes(geneList[5:9], geneName[5:9], dds, res, subtype_sample, log10)
+
+```
+
+### Using Manual Limits
+
+For cases without data, each case would need to be labeled with ER+/ER-, etc using their gene expressions. For that, a limit is needed for each gene.
+
+I am choosing the limit to be the top of the whisker of the -/ box plots. To get the limit, a summary of the data is needed with the 5 point values.
+
+```{r}
+#ER limit
+data <- genePlotPoints("ESR1", dds, res)
+
+#sub type data to use
+subData <- subtype_sample |> select(sample, ER)
+
+#Puts the row names in a column to use as a key for a full join
+plotData <- rownames_to_column(data)
+plotData <- plotData |> full_join(subData, join_by(rowname == sample))
+
+#Fills the ER column with data on if the sample is normal
+plotData <- plotData |> mutate(
+  ER = if_else(condition == "normal", condition, ER)
+)
+
+#Gets the 1st and 3rd quartiles to calculate the whisker edge
+summary <- plotData |> select(count, ER) |> group_by(ER) |> reframe(
+  five = fivenum(count)
+)
+
+Q3 <- (summary |> filter(ER == "Negative"))$five[4]
+Q1 <- (summary |> filter(ER == "Negative"))$five[2]
+thresholdER <- 1.5*(Q3-Q1) + Q3
+
+#PR limit
+data <- genePlotPoints("PGR", dds, res)
+
+#sub type data to use
+subData <- subtype_sample |> select(sample, PR)
+
+#Puts the row names in a column to use as a key for a full join
+plotData <- rownames_to_column(data)
+plotData <- plotData |> full_join(subData, join_by(rowname == sample))
+
+#Fills the ER column with data on if the sample is normal
+plotData <- plotData |> mutate(
+  PR = if_else(condition == "normal", condition, PR)
+)
+
+#Gets the 1st and 3rd quartiles to calculate the whisker edge
+summary <- plotData |> select(count, PR) |> group_by(PR) |> reframe(
+  five = fivenum(count)
+)
+
+Q3 <- (summary |> filter(PR == "Negative"))$five[4]
+Q1 <- (summary |> filter(PR == "Negative"))$five[2]
+thresholdPR <- 1.5*(Q3-Q1) + Q3
+
+#HER2 limit
+data <- genePlotPoints("ERBB2", dds, res)
+
+#sub type data to use
+subData <- subtype_sample |> select(sample, HER)
+
+#Puts the row names in a column to use as a key for a full join
+plotData <- rownames_to_column(data)
+plotData <- plotData |> full_join(subData, join_by(rowname == sample))
+
+#Fills the ER column with data on if the sample is normal
+plotData <- plotData |> mutate(
+  HER = if_else(condition == "normal", condition, HER)
+)
+
+#Gets the 1st and 3rd quartiles to calculate the whisker edge
+summary <- plotData |> select(count, HER) |> group_by(HER) |> reframe(
+  five = fivenum(count)
+)
+
+Q3 <- (summary |> filter(HER == "Negative"))$five[4]
+Q1 <- (summary |> filter(HER == "Negative"))$five[2]
+thresholdHER <- 1.5*(Q3-Q1) + Q3
+```
+
+Now, the cells that don't have the labels for sub type are labeled using the limit and are sorted into the different sub types
+
+```{r}
+data <- genePlotPoints("ESR1", dds, res)
+data <- data |> rownames_to_column()
+
+fullSubType <- data |> full_join(subtype_sample, join_by(rowname == sample))
+fullSubType <- fullSubType |> select(!c(count, `Case ID`))
+fullSubType <- column_to_rownames(fullSubType)
+
+fullSubType$PAM50 <- if_else(fullSubType$condition == "normal", "normal", fullSubType$PAM50)
+
+
+#ER class
+data <- genePlotPoints("ESR1", dds, res)
+
+#sub type data to use
+subData <- subtype_sample |> select(sample, ER)
+
+#Puts the row names in a column to use as a key for a full join
+plotData <- rownames_to_column(data)
+temp <- plotData |> full_join(subData, join_by(rowname == sample))
+
+#Fills the ER column with data on if the sample is normal
+temp <- temp |> mutate(
+  ER = if_else(condition == "normal", condition, ER)
+)
+
+for (i in 1:dim(temp)[1]){
+  if (temp$condition[i] != "normal" & is.na(temp$ER[i])){
+    temp$ER[i] <- if_else(temp$count[i] >= thresholdER, "Positive", "Negative")
+  }
+}
+
+fullSubType$ER <- temp$ER
+
+
+#PR class
+data <- genePlotPoints("PGR", dds, res)
+
+#sub type data to use
+subData <- subtype_sample |> select(sample, PR)
+
+#Puts the row names in a column to use as a key for a full join
+plotData <- rownames_to_column(data)
+temp <- plotData |> full_join(subData, join_by(rowname == sample))
+
+#Fills the ER column with data on if the sample is normal
+temp <- temp |> mutate(
+  PR = if_else(condition == "normal", condition, PR)
+)
+
+for (i in 1:dim(temp)[1]){
+  if (temp$condition[i] != "normal" & is.na(temp$PR[i])){
+    temp$PR[i] <- if_else(temp$count[i] >= thresholdPR, "Positive", "Negative")
+  }
+}
+
+fullSubType$PR <- temp$PR
+
+
+#HER class
+data <- genePlotPoints("ERBB2", dds, res)
+
+#sub type data to use
+subData <- subtype_sample |> select(sample, HER)
+
+#Puts the row names in a column to use as a key for a full join
+plotData <- rownames_to_column(data)
+temp <- plotData |> full_join(subData, join_by(rowname == sample))
+
+#Fills the ER column with data on if the sample is normal
+temp <- temp |> mutate(
+  HER = if_else(condition == "normal", condition, HER)
+)
+
+for (i in 1:dim(temp)[1]){
+  if (temp$condition[i] != "normal" & is.na(temp$HER[i])){
+    temp$HER[i] <- if_else(temp$count[i] >= thresholdHER, "Positive", "Negative")
+  }
+}
+
+fullSubType$HER <- temp$HER
+
+
+
+#Filling in PAM50 column
+for (i in 1:dim(temp)[1]){
+  if (is.na(fullSubType$PAM50[i])){
+    if(fullSubType$ER[i] == "Positive" | fullSubType$PR[i] == "Positive")
+    {fullSubType$PAM50[i] <- "ER/PR+"}
+    else
+    {
+      if(fullSubType$HER[i] == "Positive")
+      {fullSubType$PAM50[i] <- "HER2-enriched"}
+      else
+      {fullSubType$PAM50[i] <- "TNBC"}
+    }
+  }
+
+  if(fullSubType$PAM50[i] == "Luminal A" | fullSubType$PAM50[i] == "Luminal B")
+  {fullSubType$PAM50[i] <- "ER/PR+"}
+  if(fullSubType$PAM50[i] == "Basal-like")
+  {fullSubType$PAM50[i] <- "TNBC"}
+}
+```
+
+Now run DESeq2 analysis
+
+```{r}
+
+coldata2 = matrix(0, nrow = dim(combined_breast_matrix)[2], ncol = 3)
+
+coldata2 <- as.data.frame(coldata2)
+
+#Renames columns and rows
+rownames(coldata2) = colnames(combined_breast_matrix)
+colnames(coldata2) = c("condition", "subtype", "batch")
+
+coldata2$condition <-  coldata$condition
+coldata2$subtype <-  fullSubType$PAM50
+coldata2$batch <- coldata$batch
+
+coldata2$condition <- factor(coldata2$condition)
+coldata2$subtype <- factor(coldata2$subtype)
+coldata2$batch <- factor(coldata2$batch)
+
+
+
+
+dds2 <- DESeqDataSetFromMatrix(countData = combined_breast_matrix,
+                              colData = coldata2,
+                              #design = ~ batch + subtype)
+                              design = ~ subtype)
+
+dds2$subtype <- relevel(dds2$subtype, ref = "normal")
+
+#Prefilters to speed up method
+temp <- coldata2 |> group_by(subtype) |> summarize(n=n())
+
+smallestGroupSize <- min(temp$n)
+keep <- rowSums(counts(dds2) >= 10) >= smallestGroupSize
+dds2 <- dds2[keep,]
+
+#Runs all the analysis
+#Uses glm engine since it is faster, but requires likelyhood ratio test (LRT), which requires a reduced design.
+  #If only condition is used, then reduced = ~1. If batch + condition is used, then reduced = ~batch
+#dds2 <- DESeq(dds2, parallel = TRUE, fitType = "glmGamPoi", test="LRT", reduced = ~1)
+
+#Runs withoutglm
+dds2 <- DESeq(dds2, parallel = TRUE)
+
+res2 <- results(dds2)
+```
+
+#### Plotting
+
+Now plot the graphs
+
+```{r}
+
+res2NN <- results(dds2, name = "subtype_Normal.like_vs_normal")
+res2ERPR <- results(dds2, name = "subtype_ER.PR._vs_normal")
+res2HER2 <- results(dds2, name = "subtype_HER2.enriched_vs_normal")
+res2TNBC <- results(dds2, name = "subtype_TNBC_vs_normal")
+
+resList <- list(res2, res2NN, res2ERPR, res2HER2, res2TNBC)
+
+
+plotCancerTypes("CD9", dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50))
+ggsave("plots/CD9_BC_gene_expression.png")
+
+plotCancerTypes("CD151", dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50))
+ggsave("plots/CD151_BC_gene_expression.png")
+
+plotCancerTypes("ALCAM", dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50), name = "CD166")
+ggsave("plots/CD166_BC_gene_expression.png")
+
+plotCancerTypes("EPCAM", dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50))
+ggsave("plots/EPCAM_BC_gene_expression.png")
+
+plotCancerTypes("CD276", dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50))
+ggsave("plots/CD276_BC_gene_expression.png")
+
+#CD97, CD109, CD166, CD151, EPCAM
+#Use same batches or patients for better quality data
+#REscale graphs for ebtter visuals of means
+#Also try proteomics data - see if feasible to see membrane proteins only
+```
+
+Combined
+
+```{r}
+plotGeneListSubtypes(geneList[1:4], geneName[1:4], dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50))
+plotGeneListSubtypes(geneList[5:9], geneName[5:9], dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50))
+
+plotGeneListSubtypes(geneList[1:4], geneName[1:4], dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50), log10)
+plotGeneListSubtypes(geneList[5:9], geneName[5:9], dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50), log10)
+plotGeneListSubtypes(geneList[c(1, 5, 7, 8)], geneName[c(1, 5, 7, 8)], dds2, resList, rownames_to_column(fullSubType) |> select(rowname, PAM50), log10)
+```
+
+# Using paired data
+
+Since comparing all normal cells vs all cancer cells will have some batch effects and have patient differences, another way to view how the mRNA expression differs is to evaluate the fold change or log fold change (LFC) between the normal and cancer samples from the same patient.
+
+```{r}
+#Load metadata for normal and cancer cells
+metaCancer <- fromJSON(txt = "data/Cancer_Breast/metadata.repository.BRCA.cancer.json")
+
+metaNormal <- fromJSON("data/Normal_Breast/TCGA_BRCA/metadata.repository.BRCA.normal.json")
+
+metaNormal <- metaNormal |> select(associated_entities, file_name)
+metaCancer <- metaCancer |> select(associated_entities, file_name)
+
+#Extracts case id information
+metaNormal$case_id <- bind_rows( #Combines all data frames in the list
+                                      metaNormal$associated_entities
+                            )$case_id
+metaCancer$case_id <- bind_rows( #Combines all data frames in the list
+                                      metaCancer$associated_entities
+                            )$case_id
+
+#Extracts case id information
+metaNormal$barcode <- bind_rows( #Combines all data frames in the list
+                                      metaNormal$associated_entities
+                            )$entity_submitter_id
+metaCancer$barcode <- bind_rows( #Combines all data frames in the list
+                                      metaCancer$associated_entities
+                            )$entity_submitter_id
+
+#Plate information
+metaNormal <- metaNormal |> mutate(
+  plate = sapply(
+    metaNormal$barcode,
+    function(data) str_split_i(data, "-", 6)
+  )
+)
+metaCancer <- metaCancer |> mutate(
+  plate = sapply(
+    metaCancer$barcode,
+    function(data) str_split_i(data, "-", 6)
+  )
+)
+
+#Labels each file by the name of each sample
+metaNormal$sample <- sapply(
+  metaNormal$file_name,
+  function(data) str_split_i(data, "\\.", 1)
+)
+metaCancer$sample <- sapply(
+  metaCancer$file_name,
+  function(data) str_split_i(data, "\\.", 1)
+)
+
+#Keeps relevant columns
+metaNormal <-  metaNormal |> select(sample, case_id, plate)
+metaCancer <-  metaCancer |> select(sample, case_id, plate)
+
+#Data about samples from the same case, as well as their plate number
+sampleToCase <- inner_join(metaNormal, metaCancer, join_by(case_id == case_id))
+
+sampleToCase <- sampleToCase |> select(
+  case_id, normal_sample = sample.x, normal_plate = plate.x, cancer_sample = sample.y, cancer_plate = plate.y
+)
+```
+
+Now, the matrix with the combined data should be filtered to only include the cases that have the corresponding paired data.
+
+```{r}
+#Only gets the columns of the matrix with the sample id in the paired samples metadata
+
+paired_sample_list <- c(
+  unique(sampleToCase$normal_sample), 
+  unique(sampleToCase$cancer_sample)
+  )
+paired_matrix <- combined_breast_matrix[, paired_sample_list]
+```
+
+## DESeq2 analysis
+
+Now, DESeq2 analysis can be done again, but this time the design will also include the patient it is from and the plate.
+
+The coldata is prepped to allow DESeq2 to control for the covariates of the subject and that batch in its analysis
+
+```{r}
+#Creates the column data and labels its columns and rows
+coldata3 <- matrix(0, nrow = dim(paired_matrix)[2], ncol = 3)
+
+rownames(coldata3) <- colnames(paired_matrix)
+colnames(coldata3) <- c("condition", "subject", "plate")
+
+#sets values for condition and batch using metadata
+numNormal <- length(unique(sampleToCase$normal_sample))
+numCancer <- length(unique(sampleToCase$cancer_sample))
+
+#Fills in the condition data for each sample
+coldata3[1:numNormal, "condition"] = "normal"
+coldata3[(numNormal + 1):(numNormal + numCancer), "condition"] = "cancer"
+
+temp1 <- sampleToCase |> select(case_id, normal_sample, normal_plate) |> distinct(.keep_all = TRUE)
+temp2 <- sampleToCase |> select(case_id, cancer_sample, cancer_plate) |> distinct(.keep_all = TRUE)
+
+#Fills in the case data for each sample
+coldata3[temp1$normal_sample, "subject"] <- temp1$case_id
+coldata3[temp2$cancer_sample, "subject"] <- temp2$case_id
+
+#Fills in the plate data for each sample
+coldata3[temp1$normal_sample, "plate"] <- temp1$normal_plate
+coldata3[temp2$cancer_sample, "plate"] <- temp2$cancer_plate
+
+
+#Turns all the columns into factors
+coldata3 <- as.data.frame(coldata3)
+coldata3$condition <- factor(coldata3$condition)
+coldata3$subject <- factor(coldata3$subject)
+coldata3$plate <- factor(coldata3$plate)
+```
+
+Now, the matrix and coldata is input into DEseq2 analysis
+
+```{r}
+# #Creates DESeqDataSet object
+# ddsPaired <- DESeqDataSetFromMatrix(countData = paired_matrix,
+#                               colData = coldata3,
+#                               #design = ~ subject + plate + condition)
+#                               design = ~ subject + condition)
+# 
+# #Makes normal condition as the control
+# ddsPaired$condition <- relevel(ddsPaired$condition, ref = "normal")
+# 
+# #Prefilters to speed up method
+# temp <- coldata3 |> group_by(condition) |> summarize(n=n())
+# 
+# smallestGroupSize <- min(temp$n)
+# keep <- rowSums(counts(ddsPaired) >= 10) >= smallestGroupSize
+# ddsPaired <- ddsPaired[keep,]
+# 
+# #Runs all the analysis
+# #Uses glm engine since it is faster, but requires likelyhood ratio test (LRT), which requires a reduced design.
+#   #If only condition is used, then reduced = ~1. If batch + condition is used, then reduced = ~batch
+# #dds <- DESeq(dds, parallel = TRUE, fitType = "glmGamPoi", test="LRT", reduced = ~1)
+# 
+# #Runs withoutglm
+# ddsPaired <- DESeq(ddsPaired, parallel = TRUE)
+# 
+# #res <- results(dds)
+```
+
+## Limma-Voom Analysis
+
+However, DESeq2 is too slow (after running for 10 min), so I am going to try limma-voom. The counts matrix already exists as paired_matrix
+
+```{r}
+#Create experiment metadata
+factor1 <- coldata3$condition
+factor2 <- coldata3$subject
+
+#Replaces cancers and normals with C and N
+levels(factor1) <- c("C", "N")
+levels(factor2) <- 1:length(levels(factor2))
+
+#Combined the two factors to form a group
+group <- interaction(factor1, factor2)
+
+#Makes sample names more readable
+temp <- paired_matrix
+temp2 <- group
+temp2 <- unfactor(temp2)
+
+count <- 1
+for( i in 1:(length(temp2)-1)){
+  if(temp2[i] == temp2[i+1]){
+    temp2[i] <- paste0(temp2[i], ".", count)
+    count <- count +1
+  }
+  else
+  {
+    if(count != 1){
+      temp2[i] <- paste0(temp2[i], ".", count)
+      count <- 1
+    }
+  }
+}
+
+colnames(temp) <- temp2
+
+#Create list for batch
+batch <- coldata3$plate
+levels(batch) <- 1:length(levels(batch))
+
+
+#Creates DGEList object
+  d0 <- DGEList(temp)
+#d0 <- DGEList(paired_matrix)
+
+#Calculates normalization factors
+d0 <- calcNormFactors(d0)
+
+#Filter low expression genes
+cutoff <- 3
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop,] 
+```
+
+This is a multidimensional scaling (MDS) plot
+
+```{r}
+plotMDS(d, col = as.numeric(factor1))
+```
+
+Then, the normalized expression table is extracted. The log CPM values are used.
+
+```{r}
+#Writes table using log cpm data
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+write.table(logcpm,"rnaseq_workshop_normalized_counts.txt",sep="\t",quote=F)
+```
+
+The model to be fit is specified
+
+```{r}
+#Model Matrix
+mm <- model.matrix(~0 + group)
+  #For modeling batch effects
+#mm <- model.matrix(~0 + group + batch)
+mm
+
+#Voom
+y <- voom(d, mm, plot = T)
+
+```
+
+The voom plot looks "good" for condition and subject, so the data doesn't need to be filtered more.
+
+A linear model is fit using weighted least squares
+
+```{r}
+#Linear fit
+fit <- lmFit(y, mm)
+
+```
+
+Comparisons between groups can be made via contrasts
+
+Estimate the contrast between each gene, while smoothing out low expressed genes to prevent overrepresentation
+
+```{r}
+#Contrast a group
+contr <- makeContrasts("groupC.102 - groupN.102", levels = colnames(coef(fit)))
+contr
+
+#Estimate contrasts between genes for the two groups aboves
+tmp <- contrasts.fit(fit, contr)
+
+#Use empirical Bayes smoothing
+tmp <- eBayes(tmp)
+
+#Shows most differentially expressed gene. Sorted by the p value
+top.table <- topTable(tmp, sort.by = "P", n = Inf)
+head(top.table, 30)
+```
+
+Table columns:
+
+-   logFC: log2 fold change of A.C/A.D
+
+-   AveExpr: Average expression across all samples, in log2 CPM
+
+-   t: logFC divided by its standard error
+
+-   P.Value: Raw p-value (based on t) from test that logFC differs from 0
+
+-   adj.P.Val: Benjamini-Hochberg false discovery rate adjusted p-value
+
+-   B: log-odds that gene is DE (arguably less useful than the other columns)
+
+Contrasts can be made between each pair of samples, and the log fold change for each normal-cancer sample pair can be plotted in a box plot.
+
+```{r}
+pairs = list()
+
+pairs = lapply(
+  1:107,
+  function (data) paste0("groupC.", data, " - ", "groupN.", data)
+)
+
+```
+
+Then, it runs all contrasts for the pairs and extracts the log fold change of the gene(s) of interest
+
+```{r}
+#Makes the list of genes of interest
+nameToID <- function(geneName){
+  geneId <- (cancer_gene_key |> filter(gene_name==geneName))[1, ]$gene_id
+  geneId <- as.vector(geneId)[1]
+  return(geneId)
+}
+
+```
+
+Genes
+
+```{r}
+#Makes list of interested genes
+#CD97, CD109, CD151, CD166, EPCAM, CD276
+geneList <- c("ADGRE5", "CD109", "CD151", "ALCAM", "EPCAM", "CD276")
+
+geneIDList <- sapply(geneList, nameToID)
+
+#Matrix to store LFC data for all genes
+LFCdata <- matrix(0, nrow = length(pairs), ncol = length(geneList))
+colnames(LFCdata) <- geneList
+
+#Runs contrast for all pairs
+for(i in 1:length(pairs)){
+  pair <- pairs[[i]]
+  
+  #Contrast a group
+  contr <- makeContrasts(pair, levels = colnames(coef(fit)))
+
+  #Estimate contrasts between genes for the two groups aboves
+  tmp <- contrasts.fit(fit, contr)
+  
+  #Use empirical Bayes smoothing
+  tmp <- eBayes(tmp)
+  
+  #Shows most differentially expressed gene. Sorted by the p value
+  top.table <- topTable(tmp, sort.by = "P", n = Inf)
+  
+  LFCdata[i, ] <- top.table[geneIDList, ]$logFC
+  print(paste0(i, "/", length(pairs)))
+}
+```
+
+Now, the LFC data can be plotted in a boxplot
+
+```{r}
+LFCdata
+plotData <- as.data.frame(LFCdata)
+plotData <- plotData |> pivot_longer(cols = geneList, names_to = "gene", values_to = "LFC")
+
+plotData$gene <- factor(plotData$gene, levels = geneList)
+
+plotData |> ggplot(aes(x=gene, y=LFC, fill=gene)) + geom_boxplot()
+```
+
+## Subtypes with Limma-Voom
+
+Now that the DE data has been given for normal vs cancer cells, the subtypes can be factored in for more details.
+
+```{r}
+#Gets PAM50 data for the paired samples
+temp <- rownames_to_column(coldata3)
+temp2 <- rownames_to_column(fullSubType)
+temp3 <- inner_join(temp, temp2, join_by(rowname==rowname))
+
+#Turns them into factors and then 
+factor1 <- temp3$PAM50
+factor2 <- coldata3$subject
+factor3 <- coldata3$plate
+
+factor1 <- factor(factor1)
+levels(factor1) <- c("E", "H", "N", "T")
+levels(factor2) <- 1:length(levels(factor2))
+group <- interaction(factor1, factor2)
+
+group <- factor(unfactor(group))
+
+#Creates DGEList object
+d0 <- DGEList(paired_matrix)
+
+#Calculates normalization factors
+d0 <- calcNormFactors(d0)
+
+#Filter low expression genes
+cutoff <- 3
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop,] 
+
+```
+
+The MDS plot
+
+```{r}
+plotMDS(d, col = as.numeric(factor1), labels = 1:length(factor1))
+```
+
+Logcpm
+
+```{r}
+#Writes table using log cpm data
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+```
+
+Model Matrix and linear fit
+
+```{r}
+#Model Matrix
+mm <- model.matrix(~0 + group)
+  #For modeling batch effects
+#mm <- model.matrix(~0 + group + batch)
+#mm
+
+#Voom
+y <- voom(d, mm, plot = T)
+
+#Linear fit
+fit <- lmFit(y, mm)
+#head(coef(fit))
+```
+
+Now create the list of pairs
+
+```{r}
+
+pairsSubtype = c()
+
+pairs = list()
+for(i in 1:numNormal){
+  indexCopies <- which(factor2[(numNormal + 1):(numCancer + numNormal)] == factor2[i]) + numNormal
+  
+  index <- indexCopies[1]
+  pairs[[length(pairs) + 1]] <- paste0(
+    "group", factor1[index], ".", factor2[i], " - groupN.", factor2[i]
+  )
+  
+  pairsSubtype <- c(pairsSubtype, factor1[index])
+}
+
+pairsSubtype <- levels(factor1)[pairsSubtype]
+
+```
+
+Now to run contrasts for all the pairs
+
+```{r}
+#Makes list of interested genes
+#CD97, CD109, CD151, CD166, EPCAM, CD276
+geneList <- c("ADGRE5", "CD109", "CD151", "ALCAM", "EPCAM", "CD276")
+
+geneIDList <- sapply(geneList, nameToID)
+
+#Matrix to store LFC data for all genes
+LFCdata <- matrix(0, nrow = length(pairs), ncol = length(geneList))
+colnames(LFCdata) <- geneList
+
+#Runs contrast for all pairs
+for(i in 1:length(pairs)){
+  pair <- pairs[[i]]
+  
+  #Contrast a group
+  contr <- makeContrasts(pair, levels = colnames(coef(fit)))
+
+  #Estimate contrasts between genes for the two groups aboves
+  tmp <- contrasts.fit(fit, contr)
+  
+  #Use empirical Bayes smoothing
+  tmp <- eBayes(tmp)
+  
+  #Shows most differentially expressed gene. Sorted by the p value
+  top.table <- topTable(tmp, sort.by = "P", n = Inf)
+  
+  LFCdata[i, ] <- top.table[geneIDList, ]$logFC
+  print(paste0(i, "/", length(pairs)))
+}
+```
+
+Boxplots
+
+```{r}
+#Replaces all the single letters with the full subtype
+pairsSubtype <- factor(pairsSubtype)
+levels(pairsSubtype) <- c("ER/PR+", "HER2-enriched", "TNBC")
+
+#Adds the subtypes to the data
+plotData <- as.data.frame(LFCdata)
+plotData$condition <- pairsSubtype
+
+#Lengthens the data go that genes, LFC, and conditions are in their own columns
+plotData <- plotData |> pivot_longer(cols = geneList, names_to = "gene", values_to = "LFC")
+
+plotData$gene <- factor(plotData$gene, levels = geneList)
+
+#Plots the boxplot for ER/PR+ cancers
+plotData |> 
+  filter(condition=="ER/PR+") |> 
+  ggplot(aes(x=gene, y=LFC, fill=gene)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_signif(annotations = c("***", "NS", "***", "***", "***", "***"), xmin = c(1, 2, 3, 4, 5, 6), xmax = c(1, 2, 3, 4, 5, 6), y_position = 7) +
+  labs(title = "Log Fold Change of ER/PR+ Subtype", caption="Significance done via one sample t-test")
+
+#Plots the boxplot for HER2+ cancers
+plotData |> 
+  filter(condition=="HER2-enriched") |> 
+  ggplot(aes(x=gene, y=LFC, fill=gene)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_signif(annotations = c("NS", "NS", "NS", "*", "**", "**"), xmin = c(1, 2, 3, 4, 5, 6), xmax = c(1, 2, 3, 4, 5, 6), y_position = 4) +
+  labs(title = "Log Fold Change of HER2-enriched Subtype", caption="Significance done via one sample t-test")
+
+#Plots the boxplot for TNBC cancers
+plotData |> 
+  filter(condition=="TNBC") |> 
+  ggplot(aes(x=gene, y=LFC, fill=gene)) + 
+  geom_boxplot(outliers = FALSE) + 
+  geom_signif(annotations = c("NS", "NS", "NS", "NS", "***", "**"), xmin = c(1, 2, 3, 4, 5, 6), xmax = c(1, 2, 3, 4, 5, 6), y_position = 4.5) +
+  labs(title = "Log Fold Change of TNBC Subtype", caption="Significance done via one sample t-test")
+```
+
+```{r}
+t.test((plotData |> filter(condition=="ER/PR+" & gene == "ADGRE5"))$LFC)
+t.test((plotData |> filter(condition=="ER/PR+" & gene == "CD109"))$LFC)
+t.test((plotData |> filter(condition=="ER/PR+" & gene == "CD151"))$LFC)
+t.test((plotData |> filter(condition=="ER/PR+" & gene == "ALCAM"))$LFC)
+t.test((plotData |> filter(condition=="ER/PR+" & gene == "EPCAM"))$LFC)
+t.test((plotData |> filter(condition=="ER/PR+" & gene == "CD276"))$LFC)
+```

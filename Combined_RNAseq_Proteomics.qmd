@@ -1,0 +1,183 @@
+---
+title: "Combined_RNAseq_Proteomics"
+format: html
+editor: visual
+---
+
+# Loading Libraries
+
+```{r}
+library(jsonlite)
+library(httr) #For REST API calls
+library(tidyverse)
+library(ggplot2) #Plotting
+library(DESeq2) #DE Analysis
+library(Biobase) 
+library(gplots)
+library(RColorBrewer) 
+library(pheatmap) #For heat maps and quality control graphs
+library(matrixStats)
+library(lattice)
+library(gtools)
+library(dplyr)
+library(edgeR) #For data analysis and limma
+library(BiocParallel) #For running DESeq2 in parallel
+library(ggsignif)
+library(ggpubr) #Adding significance bars for graphs
+```
+
+# Loading Data
+
+## TCGA RNA-seq
+
+Done by downloading tsv files from TCGA database and then formatting them by removing the folders each file comes in using these WIndows commands:
+
+To move all files in subfolders into the mainfolder: (while in the parent directory)
+
+for /r %i in (\*) do \@move "%i" .
+
+To remove empty directories:
+
+for /d %i in (\*) do @rmdir /s /q "%i"
+
+### Lung
+
+```{r}
+#Loads tsv files of lung cells and appends vertically
+#Normal Data
+files1L <- list.files("data/Normal_Lung", pattern ="*.tsv", full.names=TRUE) #Has path to folder containing files
+col_name = c("gene_id","gene_name","gene_type","unstranded","stranded_first","stranded_second","tpm_unstranded","fpkm_unstranded","fpkm_uq_unstranded")
+lung_normal <- read_tsv(files1L, comment="#", col_names = col_name, skip=6)
+
+#Cancer Data
+files2L <- c(
+  list.files("data/Cancer_Lung/Adenomas", pattern="*.tsv", full.names=TRUE), #Has path to folders containing files
+  list.files("data/Cancer_Lung/Squamous", pattern="*.tsv", full.names=TRUE)           
+)             
+
+lung_cancer <- read_tsv(files2L, comment="#", col_names = col_name, skip=6)
+
+#Load metadata and select useful columns
+metadata <- fromJSON("data/Cancer_Lung/metadata.repository.lung.json")
+
+temp <- metadata |> select(associated_entities, file_name)
+temp$case <- bind_rows(temp$associated_entities)$case_id
+temp$sample <-sapply(temp$file_name, function(data) str_split_i(data, "\\.", 1))
+meta <- temp |> select(sample, case)
+
+
+#Find list of samples
+normList <- sapply(files1, function(data) str_split_i(data, "/", 3))
+normList <- sapply(normList, function(data) str_split_i(data, "\\.", 1))
+
+cancList <- sapply(files2, function(data) str_split_i(data, "/", 4))
+cancList <- sapply(cancList, function(data) str_split_i(data, "\\.", 1))
+
+sampleList <- c(normList, cancList)
+
+#Get metadata only within the list of samples
+lung_metadata <- meta[meta$sample %in% sampleList, ]
+```
+
+### Breast
+
+Used if the expression data is in TCGA tsv files and not formatted into rds files
+
+```{r}
+# #Load the metadata
+# filePath = "data/Normal_Breast/TCGA_BRCA/metadata.repository.2025-06-16.json"
+# 
+# temp <- fromJSON(filePath)
+# 
+# #Select columns of interest
+# temp <- temp |> select(associated_entities, file_name)
+# 
+# #Extract barcode from associated entities
+# temp$associated_entities <- bind_rows( #Combines all data frames in the list
+#                                       temp$associated_entities
+#                             )$entity_submitter_id
+# 
+# #Gets the plate value, which is the 6th part of the barcode
+# temp <- temp |> mutate(
+#   plate = sapply(
+#     temp$associated_entities,
+#     function(data) str_split_i(data, "-", 6)
+#   )
+# )
+# 
+# #Remove the barcode column and save the file for easier loading
+# temp2 <- temp |> select(!associated_entities)
+# write_rds(temp2, "data/Normal_Breast/TCGA_BRCA/metadata_BRCA_normal.rds")
+
+
+# #Reads all the tsv files in a specific order and joins them vertically
+# #temp2 was metadata from before
+# tempFiles <- sapply(#sapply applies the function over the list
+#   temp2$file_name,
+#   function(data) paste0("data/Normal_Breast/TCGA_BRCA/", data) #Custom function bc can onyl have one input
+# )
+# 
+# #Use already known col names from TCGA tsv files
+# col_name = c("gene_id","gene_name","gene_type","unstranded","stranded_first","stranded_second","tpm_unstranded","fpkm_unstranded","fpkm_uq_unstranded")
+# 
+# #Reads in data.. Skips the first 6 lines bc of non-data
+# tempData <- read_tsv(tempFiles, col_names = col_name, skip = 6)
+# 
+# #Remove unnecessry columns (Can save tpm data if not using DESeq2)
+# tempData <- tempData |> select(gene_id, gene_name, unstranded)
+# 
+# #Labels each sample using column of sample name
+# tempSample <- sapply(
+#   temp2$file_name,
+#   function(data) str_split_i(data, "\\.", 1)
+# )
+# 
+# #Labels each sample via a number and puts in the file name
+# tempData <- tempData |> mutate(
+#   sample = (row_number()-1) %/% 60660 + 1
+# )
+# 
+# tempData$sample <- tempSample[tempData$sample]
+
+# #Turns the data into a matrix
+# tempMatrix <- tempData |> pivot_wider(names_from = sample, values_from = unstranded)
+# 
+# 
+# #Removes the values after the dots from the gene_ids while keeping the _PAR_Y data
+# #Splits the gene_id along the periods 
+# temp <- sapply(tempMatrix$gene_id, function(data) str_split_1(data, "\\.")) 
+# 
+# #Finds the values whose values after the period are longer than 2, since those have _PAR_Y after 
+# temp2 <- sapply(temp[2, ], str_length) > 2  
+# 
+# #Changes the first column to include the _PAR_Y for those values 
+# temp[1, temp2] <- sapply(temp[1, temp2], function(data) paste0(data, "_PAR_Y"))  
+# 
+# #Puts it into the cancer data 
+# tempMatrix$gene_id <- temp[1, ]
+# 
+# #Saves the data in an R RDS file for easier loading
+# write_rds(tempMatrix, "data/Normal_Breast/TCGA_BRCA/normal_breast_BRCA.rds")
+```
+
+Loading RDS files
+
+```{r}
+#TCGA BRCA data
+breast_normal <- read_rds("data/Normal_Breast/TCGA_BRCA/normal_breast_BRCA.rds")
+
+#Loads metadata such as batch data for these samples
+breast_metadata_normal <- read_rds("data/Normal_Breast/TCGA_BRCA/metadata_BRCA_normal.rds")
+
+#Loads the metadata
+breast_metadata_cancer = read_rds("data/Cancer_Breast/metadata_BRCA_cancer.rds")
+
+#Load mRNA sequencing data
+breast_cancer <- read_rds("data/Cancer_Breast/cancer_breast_BRCA.rds")
+```
+
+## ProteomicsDB
+
+### Lung
+
+### Breast

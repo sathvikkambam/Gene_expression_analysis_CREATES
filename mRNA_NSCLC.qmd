@@ -1,0 +1,738 @@
+---
+title: "mRNA_NSCLC"
+format: html
+editor: visual
+---
+
+# Loading Libraries
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(ggplot2)
+library(DESeq2)
+library("Biobase")
+library("gplots")
+library("ggplot2")
+library("RColorBrewer")
+library("pheatmap")
+library("matrixStats")
+library("lattice")
+library("gtools")
+library("dplyr")
+library(edgeR)
+library(ggsignif)
+library("BiocParallel")
+library("ggpubr")
+
+
+```
+
+# Data
+
+The data used was from the TCGA database, with filters for the tissue taken from the lung, with RNA-seq data and for Gene Expression Quantification. There were 311 tsv files for normal samples and 338 NSCLC cancer samples.
+
+When downloading data from TCGA and extracting the folders with the data, the following cmds are useful for Windows:
+
+To move all files in subfolders into the mainfolder: (while in the parent directory)
+
+for /r %i in (\*) do \@move "%i" .
+
+To remove empty directories:
+
+for /d %i in (\*) do @rmdir /s /q "%i"
+
+```{r}
+#Loads tsv files of lung cells and appends vertically
+#Normal Data
+files1 <- list.files("data/Normal_Lung", pattern ="*.tsv", full.names=TRUE) #Has path to folder containing files
+col_name = c("gene_id","gene_name","gene_type","unstranded","stranded_first","stranded_second","tpm_unstranded","fpkm_unstranded","fpkm_uq_unstranded")
+lung_normal <- read_tsv(files1, comment="#", col_names = col_name, skip=6)
+
+#Cancer Data
+files2 <- c(
+  list.files("data/Cancer_Lung/Adenomas", pattern="*.tsv", full.names=TRUE), #Has path to folders containing files
+  list.files("data/Cancer_Lung/Squamous", pattern="*.tsv", full.names=TRUE),
+  list.files("data/Cancer_Lung/LCC", pattern="*.tsv", full.names=TRUE)
+)             
+
+lung_cancer <- read_tsv(files2, comment="#", col_names = col_name, skip=6)
+```
+
+Load the metadata
+
+```{r}
+#Load metadata and select useful columns
+metadata <- fromJSON("data/Cancer_Lung/metadata.repository.lung.json")
+metadata <- metadata|> bind_rows(fromJSON("data/Cancer_Lung/LCC/metadata.cart.2025-07-16.json"))
+
+temp <- metadata |> select(associated_entities, file_name)
+temp$case <- bind_rows(temp$associated_entities)$case_id
+temp$sample <-sapply(temp$file_name, function(data) str_split_i(data, "\\.", 1))
+meta <- temp |> select(sample, case)
+
+
+#Find list of samples
+normList <- sapply(files1, function(data) str_split_i(data, "/", 3))
+normList <- sapply(normList, function(data) str_split_i(data, "\\.", 1))
+
+cancList <- sapply(files2, function(data) str_split_i(data, "/", 4))
+cancList <- sapply(cancList, function(data) str_split_i(data, "\\.", 1))
+
+sampleList <- c(normList, cancList)
+
+#Get metadata only within the list of samples
+metaList <- meta[meta$sample %in% sampleList, ]
+```
+
+# Functions
+
+## Name to ID Conversion
+
+```{r}
+nameToID <- function(geneName){
+    geneID <- (unstranded_norm |> filter(gene_name==geneName))[1, ]$gene_id
+  return(geneID)
+}
+```
+
+## Plot Gene Normal vs Cancer
+
+```{r}
+plotGene <- function(geneName, ddsData, resData){
+  geneId <- (unstranded_norm |> filter(gene_name==geneName))[1, ]$gene_id
+  
+  cPlot <- plotCounts(ddsData, 
+                    gene=geneId, 
+                    intgroup="condition", 
+                    returnData = TRUE
+                    )
+  #Gets the adjusted p values for the gene
+  pValue <- resData[geneId, ]$padj
+  
+  cPlot |> ggplot(aes(x=condition, y=count, fill=condition)) + geom_boxplot() + 
+    labs(
+      title=paste0("mRNA Counts for ", geneName),
+      subtitle="Done via DESeq2 package",
+      caption=paste0("p-value = ", pValue)
+    )
+}
+```
+
+## Plot Gene List
+
+```{r}
+plotGeneList <- function(geneList, geneName, ddsData, transformFunc = NA){
+  #Makes dataframe to store list of points to plot
+  pointsPlot <- data.frame()
+  
+  #Iterates through each gene in the list and gets the normalized expression values
+  for (gene in geneList){
+          
+    cPlot <- plotCounts(ddsData, 
+                        gene=nameToID(gene), 
+                        intgroup="condition", 
+                        returnData = TRUE
+                        )
+    cPlot <- cPlot |> mutate(gene = gene)  #Labels each gene exp with gene name
+    pointsPlot <- pointsPlot |> bind_rows(cPlot)
+    
+  }
+  
+  pointsPlot$gene <- factor(pointsPlot$gene, levels = geneList)
+  
+  if(!is.na(transformFunc)){
+    pointsPlot$trans_count <- transformFunc(pointsPlot$count)
+  }
+  else{
+    pointsPlot$trans_count <- pointsPlot$count
+  }
+  
+    #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- pointsPlot |> select(trans_count, gene, condition) |> group_by(gene, condition) |> reframe(
+    five = fivenum(trans_count)[4], IQR = IQR(trans_count), max = max(trans_count)
+  )
+
+  summary <- summary |> mutate(maxLim = five + 1.5*IQR)
+  
+  maxLim <- max(summary$maxLim)
+  maxValue = max(summary$max)
+  
+  maxLim <- min(maxLim, maxValue)
+  
+  margin_top <- maxLim*0.02/maxValue
+  y_pos <- maxLim + margin_top
+  
+  pointsPlot |> ggplot(aes(x=gene, y=trans_count, fill=condition)) + 
+    ggpubr::stat_compare_means(test = 'wilcox.test', label = 'p.signif', show.legend = F, label.y= y_pos) +
+    geom_boxplot(outliers = FALSE) +
+    scale_x_discrete(labels = geneName) + 
+    labs(
+      title=paste0("Gene Expression in Non-Small Cell Lung Cancer"),
+      x = "Gene Name",
+      y="Gene Expression"
+    ) +
+    theme_classic()
+  
+}
+```
+
+## Plot Gene in Subtypes
+
+```{r}
+plotGeneSubtypes <- function(geneName, ddsData, name = ""){
+  geneId <- (unstranded_norm |> filter(gene_name==geneName))[1, ]$gene_id
+  
+  cPlot <- plotCounts(ddsData, 
+                    gene=geneId, 
+                    intgroup="condition", 
+                    returnData = TRUE
+                    )
+  cPlot$condition <- factor(unfactor(cPlot$condition), levels = c("normal", "adenocarcinoma", "squamous", "large cell"))
+  
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- cPlot |> select(count, condition) |> group_by(condition) |> reframe(
+    five = fivenum(count)[4], IQR = IQR(count), max = max(count)
+  )
+
+  maxQ3 <- max(summary$five)
+  temp <- (maxQ3 == summary$five)
+  temp <- summary[temp, ]
+  maxLim <- temp$five + 1.5*temp$IQR
+  maxValue = max(summary$max)
+  
+  maxLim <- min(maxLim, temp$max)
+  
+   if(name != ""){
+     geneName <- name
+   }
+  
+  comps = list(
+    c("normal", "adenocarcinoma"), 
+    c("normal", "squamous"),
+    c("normal", "large cell")
+  )
+  
+  margin_top <- maxLim*0.02/maxValue
+  y_pos <- maxLim + 0.08*maxLim*(0:(length(comps)-1))
+  
+  cPlot |> ggplot(aes(x=condition, y=count, fill=condition)) + 
+    geom_boxplot(outliers= F) + 
+        geom_signif(comparisons = comps, map_signif_level = TRUE, tip_length = maxLim*0.03/maxValue, y_position = y_pos) +
+    labs(
+      title=paste0(geneName, " Gene Expression in Non-Small Lung Cancer Subtypes"),
+      y = "gene expression"
+    )
+}
+```
+
+## Plot Gene List in Subtypes
+
+```{r}
+plotGeneListSubtypes <- function(geneList, geneName, ddsData, transformFunc = NA){
+
+  pointsPlot <- data.frame()
+  
+  for (gene in geneList){
+          
+    cPlot <- plotCounts(ddsData, 
+                        gene=nameToID(gene), 
+                        intgroup="condition", 
+                        returnData = TRUE
+                        )
+    cPlot <- cPlot |> mutate(gene = gene) 
+    pointsPlot <- pointsPlot |> bind_rows(cPlot)
+    
+  }
+  
+  pointsPlot$gene <- factor(pointsPlot$gene, levels=geneList)
+  
+  pointsPlot$condition <- factor(pointsPlot$condition, levels = c("normal", "adenocarcinoma", "squamous", "large cell"))
+  
+  condLevels <- levels(pointsPlot$condition)
+  
+  pointsPlot$interaction <- factor(interaction(pointsPlot$gene, pointsPlot$condition),
+                           levels = c(t(sapply(condLevels, function(d) paste(geneList, d, sep=".")))))
+  
+  labels <- c()
+  for(gene in geneList){
+    labels <- c(labels, " ", gene, " ", " ")
+  }
+  
+  #Turn genes to protein name by manually changing the names
+  labels[((0:length(geneName))*4 + 2)] <- geneName
+  
+  
+  temp <- as.data.frame(sapply(condLevels, function (d) paste(geneList, d, sep=".")))
+  comps <- list()
+  for(i in 1:length(geneList)){
+    temp1 <- list(c(temp[i, "normal"], temp[i, "adenocarcinoma"]), c(temp[i, "normal"], temp[i, "squamous"]), c(temp[i, "normal"], temp[i, "large cell"]))
+    comps <- c(comps, temp1)
+  }
+  
+  #Applies an option transform (usually log)
+  if(!is.na(transformFunc)){
+    pointsPlot$trans_count <- transformFunc(pointsPlot$count)
+  }
+  else{
+    pointsPlot$trans_count <- pointsPlot$count
+  }
+  
+  #Makes a max limit on scale by taking highest Q3s of boxplots and extending to end of whisker
+  summary <- pointsPlot |> select(trans_count, gene, condition) |> group_by(gene, condition) |> reframe(
+    five = fivenum(trans_count)[4], IQR = IQR(trans_count), max = max(trans_count)
+  )
+
+  summary <- summary |> mutate(maxLim = five + 1.5*IQR)
+  
+  maxLim <- max(summary$maxLim)
+  maxValue = max(summary$max)
+  
+  maxLim <- min(maxLim, maxValue)
+  
+  margin_top <- maxLim*0.02/maxValue
+  tip_length <- maxLim*0.02/maxValue
+  
+  y_pos <- c(rep(maxLim + 0.08*maxLim*(0:(length(levels(pointsPlot$condition)) - 2)), length(geneList)))
+  
+  pointsPlot |> ggplot(aes(x=interaction, y=trans_count, fill=condition)) + 
+    scale_x_discrete(
+      labels = labels
+    ) +
+    geom_signif(comparisons = comps,
+                map_signif_level  = T,
+                y_position = y_pos,
+                tip_length = tip_length
+                ) +
+    geom_boxplot(outliers=FALSE) +
+    labs(
+      title=paste0("Gene Expression in NSCLC Subtypes"),
+      x = "Gene Name",
+      y="Gene Expression"
+      #caption=paste0("p-value = ", pValue)
+    ) + 
+  theme_classic()
+
+}
+```
+
+# mRNA Expression Analysis
+
+## Cleaning Data
+
+The data from the tsv files contains unstranded counts for each gene, which will be used for the analysis. Analysis was done with the DESeq2 package. No batch correction was done since no batch data was available, so that is a possible improvement.
+
+```{r}
+#Isolates columns of interest and labels each gene by the sample it was taken from
+unstranded_norm <- lung_normal |> select("gene_id", "gene_name", "unstranded") |> mutate(
+  sample = ((row_number()-1) %/% 60660) + 1 #60660 different genes
+)
+
+#Turns it into a table of unstranded RNA counts
+raw_norm <- unstranded_norm |> select(!gene_name) |> pivot_wider(names_from=gene_id, values_from = unstranded)
+raw_norm <- raw_norm |> select(!sample)
+norm_matrix_raw <- as.matrix(t(raw_norm))
+colnames(norm_matrix_raw) <- paste("N", 1:dim(norm_matrix_raw)[2]
+ |> lapply(toString), sep = "")
+
+#Labels all genes with sample number
+unstranded_cancer <- lung_cancer |> select("gene_id", "gene_name", "unstranded") |> mutate(
+  sample = ((row_number()-1) %/% 60660) + 1
+)
+
+#Gets raw count matrix
+raw_cancer <- unstranded_cancer |> select(!gene_name) |> pivot_wider(names_from=gene_id, values_from = unstranded)
+raw_cancer <- raw_cancer |> select(!sample)
+norm_matrix_cancer <- as.matrix(t(raw_cancer))
+colnames(norm_matrix_cancer) <- paste("C", 1:dim(norm_matrix_cancer)[2] |> lapply(toString), sep = "")
+
+#Matrices needed to work with DESeq2
+#Combines cancer and normal data
+norm_matrix <- cbind(norm_matrix_raw, norm_matrix_cancer)
+```
+
+The DESeq2 package requires a matrix with the gene and sample data, as well as another dataframe for all the other variables associated with the samples such as type of cells.
+
+```{r}
+#Changes column data
+coldata <- data.frame(1:dim(norm_matrix)[2])
+rownames(coldata) <- colnames(norm_matrix)
+colnames(coldata) <- "condition"
+coldata <- coldata |> mutate(
+  condition = if_else(row_number() <= dim(norm_matrix_raw)[2], "normal", "cancer")
+)
+
+coldata$condition <- factor(coldata$condition)
+
+```
+
+Next, the analysis was done by making a DESeqDataSet using the matrix of unstranded counts and the dataframe of other variables. The pre-filter removed genes with very few counts to seep up analysis. The normal cells were set as the control and parallel cores were used for speed
+
+## DESeq2 Analysis
+
+```{r}
+#Parallel Cores for faster running
+#Need to set parallel = TRUE
+library("BiocParallel")
+register(SnowParam(4))
+
+#Uses DESeq2 method to analyze the matrix data
+dds <- DESeqDataSetFromMatrix(countData = norm_matrix,
+                              colData = coldata,
+                              design = ~ condition)
+#Adding gene name data
+featureData <- data.frame(gene_name=lung_normal[1:60660, "gene_name"])
+mcols(dds) <- DataFrame(mcols(dds), featureData)
+
+
+#Prefilters to speed up method
+temp <- coldata |> group_by(condition) |> summarize(n=n())
+
+smallestGroupSize <- min(temp$n)
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+
+#Sets normal patients as the control
+dds$condition <- relevel(dds$condition, ref = "normal")
+
+#Runs all the analysis
+dds <- DESeq(dds, parallel = TRUE, )
+res <- results(dds)
+```
+
+The log fold shrinkage was calculated and then plotted. The resultsNames(dds) method was used to get the name for coef=
+
+```{r}
+resLFC <- lfcShrink(dds, coef="condition_cancer_vs_normal", type="apeglm", parallel = TRUE)
+plotMA(resLFC, ylim=c(-10,10))
+```
+
+## Gene Expression Plots
+
+Then, a box plot of the counts for the genes of interest. Since the data passed used the gene_id, the gene name has to be converted to gene_id in order to be used.
+
+### Single Genes
+
+This is the genes that are being plotted
+
+```{r}
+#To get gene name, run:
+#(unstranded_norm |> filter(gene_name=="CD109"))[1, ]$gene_id
+
+#CD97, CD109, CD151, CD166, CD276, EPCAM
+plotGene("ADGRE5", dds, res)
+plotGene("CD109", dds, res)
+plotGene("CD151", dds, res)
+plotGene("ALCAM", dds, res)
+plotGene("CD276", dds, res)
+plotGene("EPCAM", dds, res)
+
+
+
+```
+
+### Multiple Genes
+
+The graphs are all going to be combined into one graph with all the genes
+
+```{r}
+geneList <- c("CD9", "ADGRE5", "CD109","MCAM", "CD151", "ALCAM", "CD276", "EPCAM", "FGFR4")
+geneName <- c("CD9", "CD97", "CD109","CD146", "CD151", "CD166", "CD276", "EPCAM", "FGFR4")
+
+
+plotGeneList(geneList[1:4], geneName[1:4], dds)
+
+plotGeneList(geneList[5:9], geneName[5:9], dds)
+
+plotGeneList(geneList[c(3, 6, 7, 8)], geneName[c(3, 6, 7, 8)], dds, log10)
+
+```
+
+# Subtype Analysis
+
+By using separating cancer cells based on the cancer type, mRNA differences can be seen between them.
+
+## Loading Data
+
+```{r}
+#Adenocarcinoma Data
+files3 <- list.files("data/Cancer_Lung/Adenomas", pattern="*.tsv", full.names=TRUE)
+col_name = c("gene_id","gene_name","gene_type","unstranded","stranded_first","stranded_second","tpm_unstranded","fpkm_unstranded","fpkm_uq_unstranded")
+lung_adeno <- read_tsv(files3, comment="#", col_names = col_name, skip=6)
+
+#Squamous Data
+files4 <- list.files("data/Cancer_Lung/Squamous", pattern="*.tsv", full.names=TRUE)
+lung_squamous <- read_tsv(files4, comment="#", col_names = col_name, skip=6)
+
+files5 <- list.files("data/Cancer_Lung/LCC", pattern="*.tsv", full.names=TRUE)
+lung_LCC <- read_tsv(files5, comment="#", col_names = col_name, skip=6)
+
+```
+
+## Cleaning Data and DESeq2 Prep
+
+The matrix for the DESeq2 analysis is made the same way as before
+
+```{r}
+
+#Labels all genes with sample number
+unstranded_adeno <- lung_adeno |> select("gene_id", "gene_name", "unstranded") |> mutate(
+  sample = ((row_number()-1) %/% 60660) + 1
+)
+unstranded_squamous <- lung_squamous |> select("gene_id", "gene_name", "unstranded") |> mutate(
+  sample = ((row_number()-1) %/% 60660) + 1
+)
+
+unstranded_LCC <- lung_LCC |> select("gene_id", "gene_name", "unstranded") |> mutate(
+  sample = ((row_number()-1) %/% 60660) + 1
+)
+
+#Gets raw count matrix
+raw_adeno <- unstranded_adeno |> select(!gene_name) |> pivot_wider(names_from=gene_id, values_from = unstranded)
+raw_adeno <- raw_adeno |> select(!sample)
+norm_matrix_adeno <- as.matrix(t(raw_adeno))
+colnames(norm_matrix_adeno) <- paste("A", 1:dim(norm_matrix_adeno)[2] |> lapply(toString), sep = "")
+
+raw_squamous <- unstranded_squamous |> select(!gene_name) |> pivot_wider(names_from=gene_id, values_from = unstranded)
+raw_squamous <- raw_squamous |> select(!sample)
+norm_matrix_squamous <- as.matrix(t(raw_squamous))
+colnames(norm_matrix_squamous) <- paste("S", 1:dim(norm_matrix_squamous)[2] |> lapply(toString), sep = "")
+
+raw_LCC <- unstranded_LCC |> select(!gene_name) |> pivot_wider(names_from=gene_id, values_from = unstranded)
+raw_LCC <- raw_LCC |> select(!sample)
+norm_matrix_LCC <- as.matrix(t(raw_LCC))
+colnames(norm_matrix_LCC) <- paste("L", 1:dim(norm_matrix_LCC)[2] |> lapply(toString), sep = "")
+
+#Matrices needed to work with DESeq2
+#Combines cancer and normal data
+norm_matrix_comb <- cbind(norm_matrix_raw, norm_matrix_adeno, norm_matrix_squamous, norm_matrix_LCC)
+```
+
+## DESeq2 Analysis
+
+This runs the DESeq2 analysis
+
+```{r}
+#Changes column data
+coldataComb <- data.frame(1:dim(norm_matrix_comb)[2])
+rownames(coldataComb) <- colnames(norm_matrix_comb)
+colnames(coldataComb) <- "condition"
+coldataComb <- coldataComb |> mutate(
+  condition = if_else(row_number() <= dim(norm_matrix_raw)[2], "normal", 
+                      if_else(row_number() <= dim(norm_matrix_raw)[2] + dim(norm_matrix_adeno)[2], "adenocarcinoma", 
+                              if_else(row_number() <= dim(norm_matrix_raw)[2] + dim(norm_matrix_adeno)[2] + dim(norm_matrix_squamous)[2], "squamous", "large cell")
+                              )
+                      )
+)
+
+coldataComb$condition <- factor(coldataComb$condition)
+coldataComb$sample <- factor(metaList$sample)
+coldataComb$case <- factor(metaList$case)
+```
+
+This sets up and runs the DESeq2 analysis.
+
+```{r}
+#Parallel Cores for faster running
+#Need to set parallel = TRUE
+library("BiocParallel")
+register(SnowParam(4))
+
+#Uses DESeq2 method to analyze the matrix data
+dds2 <- DESeqDataSetFromMatrix(countData = norm_matrix_comb,
+                              colData = coldataComb,
+                              design = ~ condition)
+#Adding gene name data
+featureData <- data.frame(gene_name=lung_normal[1:60660, "gene_name"])
+mcols(dds2) <- DataFrame(mcols(dds2), featureData)
+
+
+#Prefilters to speed up method
+temp <- coldataComb |> group_by(condition) |> summarize(n=n())
+
+smallestGroupSize <- min(temp$n)
+keep <- rowSums(counts(dds2) >= 10) >= smallestGroupSize
+dds2 <- dds2[keep,]
+
+#Sets normal patients as the control
+dds2$condition <- relevel(dds2$condition, ref = "normal")
+
+#Runs all the analysis
+dds2 <- DESeq(dds2, parallel = TRUE)
+resSquamous <- results(dds2, contrast = c("condition", "squamous", "normal"))
+resAdeno <- results(dds2, contrast = c("condition", "adenocarcinoma", "normal"))
+resLCC <- results(dds2, contrast = c("condition", "large cell", "normal"))
+```
+
+## Plotting Expression Data
+
+### Single Gene
+
+Plots
+
+```{r}
+
+#To get gene name, run:
+#(unstranded_norm |> filter(gene_name=="CD109"))[1, ]$gene_id
+#CD151
+resList <- list(resAdeno, resSquamous)
+
+
+
+plotGeneSubtypes("ADGRE5", dds2, "CD109")
+ggsave("plots/CD109_NSCLC_gene_expression.png")
+
+plotGeneSubtypes("CD151", dds2)
+ggsave("plots/CD151_NSCLC_gene_expression.png")
+
+plotGeneSubtypes("ALCAM", dds2, "CD166")
+ggsave("plots/CD166_NSCLC_gene_expression.png")
+
+plotGeneSubtypes("EPCAM", dds2)
+ggsave("plots/EPCAM_NSCLC_gene_expression.png")
+
+plotGeneSubtypes("CD276", dds2)
+ggsave("plots/CD276_NSCLC_gene_expression.png")
+
+```
+
+### Multiple Genes
+
+Now to combine all the graphs
+
+```{r}
+
+plotGeneListSubtypes(geneList[1:4], geneName[1:4], dds2)
+plotGeneListSubtypes(geneList[5:9], geneName[5:9], dds2)
+plotGeneListSubtypes(geneList[c(3, 6, 7, 8)], geneName[c(3, 6, 7, 8)], dds2, log10)
+
+```
+
+# Limma Analysis
+
+Function
+
+```{r}
+#Converts a gene name to an id
+nameToID <- function(geneName){
+  geneId <- (unstranded_norm |> filter(gene_name==geneName))[1, ]$gene_id
+  geneId <- as.vector(geneId)[1]
+  return(geneId)
+}
+```
+
+Limma
+
+```{r}
+#Make metadata
+condition <- coldataComb$condition
+case <- coldataComb$case
+
+
+condition <- relevel(condition, ref="normal")
+
+#Creates DGEList object
+d0 <- DGEList(norm_matrix_comb)
+
+#Calculates normalization factors
+d0 <- calcNormFactors(d0)
+
+#Filter low expression genes
+cutoff <- 100
+drop <- which(apply(cpm(d0), 1, max) < cutoff)
+d <- d0[-drop,] 
+
+#MDS Plot
+#plotMDS(d, col = as.numeric(condition))
+
+#LogCPM data
+logcpm <- cpm(d, prior.count=2, log=TRUE)
+
+
+#Makes design of analysis
+mm <- model.matrix(~0 + condition)
+
+#VoomLmFit
+fit <- voomLmFit(d, mm, plot = T)
+fit <- eBayes(fit)
+
+cPlot = data.frame()
+
+for( gene in geneList){
+  norm <- as.data.frame(fit$EList$E[nameToID(gene), ])
+  norm$condition <- coldataComb$condition
+  norm$gene <- gene
+  
+  colnames(norm) <- c("counts", "condition", "gene")
+  
+  cPlot <- cPlot |> bind_rows(norm)
+}
+
+# #Plotting expression values
+# norm <- as.data.frame(edgeR::cpm(d)[gene, ]) # to get normalized expression values.
+# norm$condition <- sub_meta$condition
+# colnames(norm) <- c("counts", "condition")
+
+cPlot$condition <- relevel(cPlot$condition, ref = "normal")
+
+cPlot$gene <- factor(cPlot$gene, levels = geneList)
+
+cPlot |> ggplot(aes(x = gene, y= counts, fill = condition)) + geom_boxplot(outliers = F) + 
+  labs(
+    title=paste("mRNA Counts for genes of interest"),
+    subtitle = "Limma-voom",
+    y = "log2CPM"
+  )
+```
+
+# Quality Analysis
+
+## Heatmap
+
+This produces a heat map of the normal vs cancer dataset
+
+```{r}
+library("pheatmap")
+ntd <- normTransform(dds2)
+vsd <- vst(dds2, blind=FALSE)
+
+select <- order(rowMeans(counts(dds2,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds2)[,c("condition")])
+rownames(df) <- colnames(assay(ntd)[select,])
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=FALSE, cluster_cols=FALSE, annotation_col=df)
+
+```
+
+Heatmap
+
+```{r}
+select <- order(rowMeans(counts(dds2,normalized=TRUE)),
+                decreasing=TRUE)[1:20]
+df <- as.data.frame(colData(dds2)[,c("condition")])
+rownames(df) <- colnames(assay(ntd)[select,])
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=FALSE, cluster_cols=FALSE, annotation_col=df)
+
+```
+
+Sample to Sample diffs
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsd$condition, vsd$type, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows=sampleDists,
+         clustering_distance_cols=sampleDists,
+         col=colors)
+
+
+```
+
+```{r}
+#plotPCA(vsd, intgroup=c("condition", "type"))
+
+```
